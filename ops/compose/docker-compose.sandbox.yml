@@ -9,10 +9,16 @@
 # and flips the provider back to docker. It is applied on top of, never instead
 # of, the prod file:
 #
-#   docker compose \
+#   docker compose --env-file "$PWD/.env" \
 #     -f infra/compose/docker-compose.prod.yml \
 #     -f ops/compose/docker-compose.sandbox.yml \
 #     up -d --build
+#
+# Every relative path below is resolved against the PROJECT DIRECTORY, which
+# Compose takes from the first -f file: infra/compose, not ops/compose. That is
+# why the build contexts read as if this file lived beside the prod one, and why
+# --project-directory must NOT be overridden: doing so repoints the prod file's
+# own `env_file: ../../.env` at /.env and the stack fails to resolve.
 #
 # Everything HDS-specific lives under ops/ so that merging upstream never
 # conflicts with our deployment configuration.
@@ -24,7 +30,7 @@ services:
   computer:
     image: rakazo/computer:local
     build:
-      context: ../../infra/sandboxes/computer
+      context: ../sandboxes/computer
     command: ["true"]
     restart: "no"
 
