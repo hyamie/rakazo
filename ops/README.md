@@ -96,20 +96,34 @@ provider key. The virtual key is `LiteLLM - VKey Rakazo` in the 1Password
 
 ## Getting in
 
-Use `ssh rakazo-vm`, which jumps via `pve-node-2`.
+**Web UI: `https://192.168.60.10`** from Main or over the Road-Warrior VPN. The
+certificate comes from Caddy's internal CA, so the first visit warns; the root is
+at `/data/caddy/pki/authorities/local/root.crt` inside the caddy container if you
+want to trust it once. `http://` 308-redirects to `https://`.
 
-The direct path does not work: the UDM's IPS matches `ET SCAN Potential SSH Scan
-OUTBOUND` (signature 2003068) on inter-VLAN SSH and drops the flow into its
-`ips` ipset with a ~200 s timeout, so sessions fail and intermittently recover.
-Verified on the gateway, not inferred:
+Two things about that edge were wrong out of the box and are fixed in
+`ops/compose/Caddyfile.lan`:
 
-```
-# ipset list ips
-192.168.60.10,tcp:22,192.168.10.117 timeout 197
-```
+- `Caddyfile.prod` defaults `RAKAZO_HOST` to `app.example.com` and attempts a
+  **public ACME issuance** against a box with no public DNS. It fails on a loop
+  and the edge never serves. `local_certs` replaces it.
+- With `local_certs` alone, browsing to the **bare IP hangs**. Neither curl nor a
+  browser sends SNI for an IP literal (RFC 6066), so Caddy has no site to match
+  and never finishes the handshake: port 443 accepts, the request times out, the
+  log says nothing. It is indistinguishable from a firewall drop, and it cost a
+  detour into the gateway before `--resolve` with a hostname returned 200 against
+  the same server. `default_sni` pins the fallback.
 
-node-2 holds an address on VLAN 60, so it reaches the VM at L2 and never
-touches the gateway. This is the same false positive already written up in
-`~/projects/active/ubiquiti/docs/ips-github-ssh-fix-options.md`. The permanent
-fix is an IPS exception scoped to that signature; it has not been applied
-because it changes the production gateway's security posture.
+**Shell: `ssh rakazo-vm`**, which jumps via `pve-node-2`. Direct SSH to the VM
+works and then stops working on a ~5 minute cycle: the UDM's IPS matches
+`ET SCAN Potential SSH Scan OUTBOUND` (sig 2003068) on inter-VLAN SSH and
+blocklists the flow. HTTPS is unaffected. Full measurement in `ops/network.md`.
+
+## Redeploying
+
+`./ops/deploy.sh up` passes `--force-recreate`, deliberately. Compose keys a
+container's config hash off the rendered service definition, and an edit to
+`.env` that only moves an interpolated bind-mount source can leave a running
+container on the old file. That is not hypothetical: Caddy sat on the upstream
+Caddyfile through a redeploy and kept retrying ACME for `app.example.com` while
+`.env` had already been corrected.
