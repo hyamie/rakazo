@@ -121,6 +121,20 @@ Streaming needs no configuration. Doc rule 1 requires `stream: true` on the five
 `chatgpt-*` groups or they return an empty completion silently, and pi-ai's
 `openai-completions` API sets it unconditionally.
 
+### A correction worth keeping
+
+An earlier pass here reported the ChatGPT lane as broken, on the strength of
+`ChatgptException - Unknown items in responses API response: []` from both
+`chatgpt-sol` and `chatgpt-terra`. That was a bad test, not a bad gateway: the
+calls were non-streaming, and doc rule 1 says plainly that a non-streaming call
+to those five returns an empty completion, 100% of the time. Re-run with
+`stream: true` the same key and the same model answer correctly. Nothing on the
+gateway needed fixing.
+
+The general shape: a silent-failure mode documented as expected behaviour will
+read as an outage to anyone who tests it the wrong way. Check the access doc
+before reporting the infrastructure broken.
+
 ### Vision
 
 Computer use sends a screenshot every step, so this decides whether a bot can
