@@ -28,6 +28,7 @@ import {
 import { textContentArg } from "./tool-text.js";
 
 import { isProviderAllowed, PROVIDER_ALLOWLIST_ENV } from "./pi-models.js";
+import { LOCAL_PROVIDER_ID, localApiKey } from "./pi-local-provider.js";
 const running = new Map<string, AbortController>();
 // Built on first use, not at module load: entry points call loadRootEnv() after
 // their imports, and ESM hoists those imports, so module-level env reads here
@@ -130,10 +131,15 @@ export class PiAgentRuntime implements AgentRuntime {
           ? undefined
           : request.model.provider === OPENAI_COMPATIBLE_PROVIDER_ID
             ? request.model.apiKey || "local"
-            : // Only OpenRouter may fall back to the OpenRouter env key. Handing it to
-              // another provider would ship our key to a vendor it was not issued for.
+            : // Only OpenRouter and the operator's own local gateway may fall back to
+              // an env key. Handing either to a third provider would ship a token to a
+              // vendor it was not issued for.
               (request.model.apiKey ??
-              (provider === "openrouter" ? process.env.OPENROUTER_API_KEY : undefined));
+              (provider === "openrouter"
+                ? process.env.OPENROUTER_API_KEY
+                : provider === LOCAL_PROVIDER_ID
+                  ? localApiKey()
+                  : undefined));
         const toolDefs = request.tools.length ? request.tools : builtinAgentTools;
         const nestedAgents = new Set<Agent>();
         const host: ToolHost = {
