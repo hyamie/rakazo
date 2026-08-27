@@ -104,6 +104,16 @@ services:
       SANDBOX_PROVIDER: docker
       SANDBOX_SUPERVISOR_URL: http://supervisor:7091
       SANDBOX_SUPERVISOR_TOKEN: ${SANDBOX_SUPERVISOR_TOKEN:?Set SANDBOX_SUPERVISOR_TOKEN in .env}
+    # The worker drives the run loop and therefore talks to the supervisor, so it
+    # needs `control` on top of the app/data it gets from the prod file. Upstream
+    # does not list it because upstream's worker uses e2b and never calls a
+    # supervisor at all. Omitting it does not fail loudly: the hostname simply
+    # does not resolve, every run dies in setup with "fetch failed", and the bot
+    # goes silent while its computer container sits there running perfectly.
+    networks:
+      - app
+      - data
+      - control
     depends_on:
       supervisor:
         condition: service_started
