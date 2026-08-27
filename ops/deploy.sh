@@ -26,7 +26,12 @@ COMPOSE=(docker compose
 
 case "${1:-up}" in
   config)  "${COMPOSE[@]}" config ;;
-  up)      "${COMPOSE[@]}" up -d --build ;;
+  # --force-recreate because Compose keys a container's config hash off the
+  # rendered service definition, and an edit to .env that only changes an
+  # interpolated bind-mount source can leave a running container on the old
+  # file. That is not hypothetical: Caddy sat on the upstream Caddyfile through
+  # a redeploy and kept retrying a public ACME issuance for app.example.com.
+  up)      "${COMPOSE[@]}" up -d --build --force-recreate ;;
   down)    "${COMPOSE[@]}" down ;;
   logs)    shift; "${COMPOSE[@]}" logs -f "$@" ;;
   ps)      "${COMPOSE[@]}" ps ;;
