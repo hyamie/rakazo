@@ -96,8 +96,33 @@ vault, scoped to two lanes and nothing else:
 
 | Lane | Models |
 |---|---|
-| ChatGPT Pro subscription | `chatgpt-sol`, `chatgpt-terra` |
-| Local hardware | `gx10-fast`, `gx10-coder` (vLLM on the GX10), `ollama-qwen3-5-35b-a3b`, `ollama-qwen3-5-9b` (19th Hole), `ollama-gemma4-12b` |
+| ChatGPT Pro subscription | `chatgpt-sol`, `chatgpt-terra` — **currently failing**, see below |
+| Local hardware | `gx10-fast`, `gx10-coder` (vLLM on the GX10), `ollama-qwen3-5-35b-a3b`, `ollama-qwen3-5-9b` (19th Hole), **`ollama-gemma4-12b`** (Ollama on node-1) |
+
+### Vision
+
+Computer use sends a screenshot every step, so a bot that cannot see cannot
+drive a computer at all. **`ollama-gemma4-12b` is the only vision-capable model
+on an approved lane**, and it runs on Mike's own hardware, so screenshots of his
+desktop never leave the house and cost nothing. It is both `PI_DEFAULT_MODEL`
+and the sole entry in `RAKAZO_OPENAI_COMPATIBLE_VISION_MODELS`.
+
+That was measured, not assumed. A single correct answer on one image proves
+nothing, so the check was three solid-colour PNGs through the gateway:
+
+```
+red    (220,0,0)   -> "Maroon"
+blue   (0,0,220)   -> "Navy"
+yellow (230,230,0) -> "Olive"
+```
+
+Three for three on hue with a consistent darkness bias. A model guessing would
+not track hue across all three; the bias itself does not matter for reading UI.
+
+The `gx10-*` (`qwen3.8-27b`) and `ollama-qwen3-5-*` models are text-only, and
+the ChatGPT lane rejects image content **and plain text** with
+`ChatgptException - Unknown items in responses API response: []`. That is a
+LiteLLM-side fault and is Mike's to fix; nothing here works around it.
 
 > **Do not put `gpt4o-vision` back.** On this LiteLLM it routes to
 > `openrouter/openai/gpt-4o`, so selecting it sends traffic and money to
