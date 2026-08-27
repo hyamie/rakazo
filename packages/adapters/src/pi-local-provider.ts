@@ -33,6 +33,24 @@ const DEFAULT_BASE_URL = "http://127.0.0.1:11434/v1";
 const DEFAULT_CONTEXT_WINDOW = 32_768;
 const DEFAULT_MAX_TOKENS = 4_096;
 
+/**
+ * Bearer token for the local model server.
+ *
+ * The default stays "local" because a keyless Ollama or LM Studio ignores the
+ * header entirely, which is what this provider was written for. But "on the
+ * operator's own hardware" and "unauthenticated" are not the same thing: a
+ * self-hosted gateway fronting those servers (LiteLLM, LiteLLM-style proxies,
+ * vLLM with --api-key) does check it, and rejects the placeholder outright:
+ *
+ *   401 LiteLLM Virtual Key expected. Received=****, expected to start with 'sk-'
+ *
+ * With no way to supply a token, every model behind such a gateway is
+ * unreachable through this provider no matter how it is configured.
+ */
+export function localApiKey(): string {
+  return process.env.RAKAZO_LOCAL_MODELS_API_KEY?.trim() || "local";
+}
+
 export function localBaseUrl(): string {
   const value = process.env.RAKAZO_LOCAL_MODELS_URL?.trim() || DEFAULT_BASE_URL;
   let url: URL;
@@ -100,7 +118,7 @@ export function localProvider(): Provider | undefined {
       apiKey: {
         name: "Local model server",
         resolve: async () => ({
-          auth: { apiKey: "local", baseUrl: localBaseUrl() },
+          auth: { apiKey: localApiKey(), baseUrl: localBaseUrl() },
           source: "local model server",
         }),
       },
