@@ -1,0 +1,100 @@
+# Local Docker computers on top of the hardened prod stack.
+#
+# docker-compose.prod.yml is the hardened topology but pins SANDBOX_PROVIDER to
+# e2b and ships no supervisor, so bot computers can only run off-host. E2B is
+# not viable here: its free tier caps a sandbox session at one hour and Rakazo's
+# model is a persistent Team Computer, which puts it on the $150/mo Pro tier.
+#
+# This overlay grafts the supervisor and the computer image onto the prod stack
+# and flips the provider back to docker. It is applied on top of, never instead
+# of, the prod file:
+#
+#   docker compose \
+#     -f infra/compose/docker-compose.prod.yml \
+#     -f ops/compose/docker-compose.sandbox.yml \
+#     up -d --build
+#
+# Everything HDS-specific lives under ops/ so that merging upstream never
+# conflicts with our deployment configuration.
+
+services:
+  # Build-only target. The supervisor creates bot computers from this image by
+  # name, so it has to exist locally before the first bot starts; it is not a
+  # long-running service.
+  computer:
+    image: rakazo/computer:local
+    build:
+      context: ../../infra/sandboxes/computer
+    command: ["true"]
+    restart: "no"
+
+  supervisor:
+    build:
+      context: ../..
+      dockerfile: infra/sandboxes/supervisor/Dockerfile
+    restart: unless-stopped
+    init: true
+    # No `cap_drop: ALL` and no `no-new-privileges` here, unlike its siblings:
+    # this process talks to the Docker socket and creating containers needs the
+    # privileges that come with it. That asymmetry is exactly why the whole
+    # stack lives in a dedicated VM rather than beside the other node-2
+    # services, and why it sits on an isolated VLAN.
+    pids_limit: 256
+    mem_limit: 512m
+    env_file:
+      - ../../.env
+    environment:
+      DATA_DIR: /data
+      SUPERVISOR_HOST: "0.0.0.0"
+      SUPERVISOR_PORT: "7091"
+      DOCKER_SOCKET: /var/run/docker.sock
+      RAKAZO_COMPUTER_IMAGE: rakazo/computer:local
+      # The screen URL is loaded by a browser on Mike's laptop, not from inside
+      # the compose network, so the supervisor must hand back the published host
+      # mapping. Leaving SANDBOX_SCREEN_NETWORK unset keeps that default; the
+      # `internal` value returns a 172.x container IP no external browser can
+      # reach.
+      SANDBOX_SCREEN_HOST: ${SANDBOX_SCREEN_HOST:?Set SANDBOX_SCREEN_HOST to the VM address in .env}
+      SANDBOX_SUPERVISOR_TOKEN: ${SANDBOX_SUPERVISOR_TOKEN:?Set SANDBOX_SUPERVISOR_TOKEN in .env}
+      # Per-computer ceilings. Rakazo leaves bot computers uncapped upstream;
+      # feat/sandbox-resource-limits adds these and they are set explicitly here
+      # so the sizing is visible next to the host it runs on.
+      RAKAZO_COMPUTER_MEMORY: ${RAKAZO_COMPUTER_MEMORY:-2g}
+      RAKAZO_COMPUTER_CPUS: ${RAKAZO_COMPUTER_CPUS:-1.5}
+      RAKAZO_COMPUTER_PIDS_LIMIT: ${RAKAZO_COMPUTER_PIDS_LIMIT:-512}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - appdata:/data
+    networks:
+      - control
+    depends_on:
+      computer:
+        condition: service_completed_successfully
+
+  api:
+    environment:
+      SANDBOX_PROVIDER: docker
+      SANDBOX_SUPERVISOR_URL: http://supervisor:7091
+      SANDBOX_SUPERVISOR_TOKEN: ${SANDBOX_SUPERVISOR_TOKEN:?Set SANDBOX_SUPERVISOR_TOKEN in .env}
+      # Upstream prod wires api to the updater. We do not run it: a second
+      # root-equivalent Docker socket for a single-operator internal tool is not
+      # worth the exposure, and its official path refuses anyway while only a
+      # v0.1.0-beta prerelease tag exists.
+      RAKAZO_UPDATER_URL: ""
+    depends_on:
+      supervisor:
+        condition: service_started
+
+  worker:
+    environment:
+      SANDBOX_PROVIDER: docker
+      SANDBOX_SUPERVISOR_URL: http://supervisor:7091
+      SANDBOX_SUPERVISOR_TOKEN: ${SANDBOX_SUPERVISOR_TOKEN:?Set SANDBOX_SUPERVISOR_TOKEN in .env}
+    depends_on:
+      supervisor:
+        condition: service_started
+
+  # Not run. Assigning a profile that is never activated is the documented way
+  # to exclude a service the base file defines: `up` skips it entirely.
+  updater:
+    profiles: ["never"]
