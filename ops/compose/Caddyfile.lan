@@ -14,6 +14,14 @@
 
 {
 	local_certs
+
+	# Browsers and curl send no SNI when the address bar holds a bare IP (RFC 6066
+	# forbids an IP literal in server_name). With no SNI and no default, Caddy has
+	# no site to match and the TLS handshake simply hangs: port 443 accepts the
+	# connection and nothing ever comes back, which reads as a network block
+	# rather than a config problem. This pins the fallback to the IP site, whose
+	# certificate carries the matching IP SAN.
+	default_sni 192.168.60.10
 }
 
 https://192.168.60.10, https://rakazo.sandbox.lan {
