@@ -1,0 +1,37 @@
+# LAN Caddyfile for the VLAN 60 deployment.
+#
+# The upstream Caddyfile.prod takes a bare hostname and defaults it to
+# app.example.com, which makes Caddy attempt a public ACME issuance. There is no
+# public DNS record for this box and no inbound path to it, so that fails and
+# takes the whole edge down with it.
+#
+# `local_certs` switches issuance to Caddy's own internal CA. That matters more
+# than it looks: Better Auth sets session cookies, and serving plain HTTP would
+# put them on the wire in clear across the LAN. The first visit shows a
+# certificate warning; trust Caddy's root once (it is at
+# /data/caddy/pki/authorities/local/root.crt inside the caddy container) and it
+# goes away.
+
+{
+	local_certs
+}
+
+https://192.168.60.10, https://rakazo.sandbox.lan {
+	encode zstd gzip
+
+	handle /health {
+		reverse_proxy api:3100
+	}
+
+	handle /api/* {
+		reverse_proxy api:3100
+	}
+
+	handle /rpc/* {
+		reverse_proxy api:3100
+	}
+
+	handle {
+		reverse_proxy web:5173
+	}
+}
