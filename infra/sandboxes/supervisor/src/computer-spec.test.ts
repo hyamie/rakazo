@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   COMPUTER_IMAGE,
   computerNetworkNameFor,
@@ -242,5 +242,50 @@ describe("computer resource limits", () => {
 
   it("parses byte counts without a unit suffix", () => {
     expect(parseMemoryBytes("X", "1073741824")).toBe(1024 ** 3);
+  });
+});
+
+describe("computer screen bind host", () => {
+  const ENV = "RAKAZO_COMPUTER_BIND_HOST";
+  let saved: string | undefined;
+
+  beforeEach(() => {
+    saved = process.env[ENV];
+    delete process.env[ENV];
+    vi.resetModules();
+  });
+
+  afterEach(() => {
+    if (saved === undefined) delete process.env[ENV];
+    else process.env[ENV] = saved;
+    vi.resetModules();
+  });
+
+  it("binds the screen to loopback by default", async () => {
+    const { computerPortBindings } = await import("./computer-spec.js");
+    const { PortBindings } = computerPortBindings();
+    for (const bindings of Object.values(PortBindings)) {
+      for (const b of bindings) expect(b.HostIp).toBe("127.0.0.1");
+    }
+  });
+
+  it("binds where sibling containers can reach when configured", async () => {
+    process.env[ENV] = "172.17.0.1";
+    vi.resetModules();
+    const { computerPortBindings } = await import("./computer-spec.js");
+    const { PortBindings } = computerPortBindings();
+    const hosts = new Set(
+      Object.values(PortBindings).flatMap((bs) => bs.map((b) => b.HostIp)),
+    );
+    expect([...hosts]).toEqual(["172.17.0.1"]);
+  });
+
+  it("publishes both the view and control port for every screen", async () => {
+    process.env[ENV] = "172.17.0.1";
+    vi.resetModules();
+    const { computerPortBindings, TEAM_SCREEN_LIMIT } = await import("./computer-spec.js");
+    const { PortBindings, ExposedPorts } = computerPortBindings();
+    expect(Object.keys(PortBindings)).toHaveLength(TEAM_SCREEN_LIMIT * 2);
+    expect(Object.keys(ExposedPorts)).toHaveLength(TEAM_SCREEN_LIMIT * 2);
   });
 });

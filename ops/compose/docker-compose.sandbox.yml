@@ -60,7 +60,16 @@ services:
       # mapping. Leaving SANDBOX_SCREEN_NETWORK unset keeps that default; the
       # `internal` value returns a 172.x container IP no external browser can
       # reach.
-      SANDBOX_SCREEN_HOST: ${SANDBOX_SCREEN_HOST:?Set SANDBOX_SCREEN_HOST to the VM address in .env}
+      # These two must name the SAME address, and it must be one the supervisor
+      # and web containers can reach. BIND_HOST is where the bot computer's
+      # screen ports are published; SCREEN_HOST is where the supervisor probes
+      # for readiness and what the screen proxy is pointed at. Loopback (the
+      # upstream default) is not the host from inside a container, so the probe
+      # hangs its full timeout on every run and the bot never answers.
+      # The docker bridge gateway is the right value: siblings reach it, and
+      # unlike 0.0.0.0 it keeps an unauthenticated VNC port off the LAN.
+      RAKAZO_COMPUTER_BIND_HOST: ${RAKAZO_COMPUTER_BIND_HOST:-172.17.0.1}
+      SANDBOX_SCREEN_HOST: ${SANDBOX_SCREEN_HOST:-172.17.0.1}
       SANDBOX_SUPERVISOR_TOKEN: ${SANDBOX_SUPERVISOR_TOKEN:?Set SANDBOX_SUPERVISOR_TOKEN in .env}
       # Per-computer ceilings. Rakazo leaves bot computers uncapped upstream;
       # feat/sandbox-resource-limits adds these and they are set explicitly here

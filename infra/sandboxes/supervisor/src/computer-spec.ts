@@ -5,6 +5,26 @@ export const TEAM_SCREEN_LIMIT = 8;
 export const SCREEN_HOST = process.env.SANDBOX_SCREEN_HOST ?? "127.0.0.1";
 
 /**
+ * Host address the computer's screen ports are published on.
+ *
+ * The default binds to loopback, which is right when the supervisor and the web
+ * app run directly on the same host as the bot containers. It breaks silently
+ * the moment they are containerised, as they are in docker-compose.prod.yml:
+ * the supervisor publishes the screen on the host's 127.0.0.1, then probes it
+ * at SANDBOX_SCREEN_HOST, and from inside its own network namespace that
+ * address is not the host. The probe cannot succeed, so it hangs for its full
+ * timeout on every attempt, the run re-queues, and the bot never answers. The
+ * failure surfaces as a run that loops "running -> queued" with no error, which
+ * looks like a model problem and is not.
+ *
+ * Set this to an address the sibling containers can reach. The docker bridge
+ * gateway is the right choice: siblings reach it, and unlike 0.0.0.0 it does
+ * not put an unauthenticated VNC port on the LAN. Browsers never touch it
+ * directly; the web app's signed screen proxy is the only path in.
+ */
+export const COMPUTER_BIND_HOST = process.env.RAKAZO_COMPUTER_BIND_HOST ?? "127.0.0.1";
+
+/**
  * Resource ceilings for a bot computer.
  *
  * A computer runs Xvfb, a window manager and a full Chromium on behalf of an
@@ -114,8 +134,8 @@ export function computerPortBindings() {
     const ports = screenPorts(index);
     ExposedPorts[`${ports.viewPort}/tcp`] = {};
     ExposedPorts[`${ports.controlPort}/tcp`] = {};
-    PortBindings[`${ports.viewPort}/tcp`] = [{ HostIp: "127.0.0.1", HostPort: "0" }];
-    PortBindings[`${ports.controlPort}/tcp`] = [{ HostIp: "127.0.0.1", HostPort: "0" }];
+    PortBindings[`${ports.viewPort}/tcp`] = [{ HostIp: COMPUTER_BIND_HOST, HostPort: "0" }];
+    PortBindings[`${ports.controlPort}/tcp`] = [{ HostIp: COMPUTER_BIND_HOST, HostPort: "0" }];
   }
   return { ExposedPorts, PortBindings };
 }
