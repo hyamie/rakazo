@@ -21,8 +21,8 @@ network in `Dmz`, so the isolation is written explicitly rather than inherited.
 | Idx | Policy | Effect |
 |---|---|---|
 | 10003 | `Allow-VPN-to-Sandbox` | Road-Warrior VPN reaches the sandbox, so the web UI and bot screens work from the phone and from away. No new ingress. |
-| 10022 | `Allow-Sandbox-to-LiteLLM` | → `192.168.10.11` only. |
-| 10023 | `Allow-Sandbox-to-n8n` | → `192.168.10.13` only. |
+| 10022 | `Allow-Sandbox-to-LiteLLM` | → `192.168.10.11:4000/tcp` only. |
+| 10023 | `Allow-Sandbox-to-n8n` | → `192.168.10.13:5678/tcp` only. |
 | 10024 | `Block-Sandbox-to-Private` | → Core, Main, Media, IoT, Cameras, Guest: denied. |
 | 10025 | `Block-Sandbox-to-Gateway-Mgmt` | → the other VLANs' gateway IPs: denied. |
 
@@ -39,10 +39,14 @@ pve-node-2    :8006 blocked     Home Assistant :8123          blocked
 UDM 192.168.1.1 / .10.1 / .30.1 :443          blocked
 ```
 
-`192.168.10.11` and `.13` are whole-host allows, not port-scoped. Both hosts run
-other services (Postgres 16 on node-1, guacamole/ntfy/garage on node-3) that a
-bot can therefore reach. Narrowing these to `:4000` and `:5678` is the obvious
-next tightening.
+Both carve-outs are port-scoped, so the rest of what those hosts run stays out
+of reach. Verified:
+
+```
+192.168.10.11:4000 LiteLLM   REACHABLE     192.168.10.13:5678 n8n     REACHABLE
+192.168.10.11:5432 Postgres  blocked       192.168.10.13:3900 garage  blocked
+192.168.10.11:8006 PVE mgmt  blocked
+```
 
 ## Known gap
 
