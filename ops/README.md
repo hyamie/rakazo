@@ -86,13 +86,26 @@ and opt-out via `"0"`, `"none"` or `"unlimited"`.
 
 ## Models
 
-All LLM traffic goes through LiteLLM at `192.168.10.11:4000`, never a direct
-provider key. The virtual key is `LiteLLM - VKey Rakazo` in the 1Password
-`ClaudeAgents` vault, scoped to `gpt4o-vision`, `claude-sonnet`, `claude-haiku`.
+Every model reaches this deployment through **LiteLLM on `192.168.10.11:4000`
+and nothing else**. `RAKAZO_PROVIDER_ALLOWLIST=openai-compatible` enforces it in
+two places: the picker never lists another provider, and the runtime refuses one
+before resolving a model, so a connection stored earlier cannot keep billing.
 
-> Those three are metered provider spend on the OpenAI and Anthropic accounts
-> behind LiteLLM, not subscription capacity. A bot driving a computer sends a
-> screenshot per step, so a long computer-use session is the expensive shape.
+The virtual key is `LiteLLM - VKey Rakazo` in the 1Password `ClaudeAgents`
+vault, scoped to two lanes and nothing else:
+
+| Lane | Models |
+|---|---|
+| ChatGPT Pro subscription | `chatgpt-sol`, `chatgpt-terra` |
+| Local hardware | `gx10-fast`, `gx10-coder` (vLLM on the GX10), `ollama-qwen3-5-35b-a3b`, `ollama-qwen3-5-9b` (19th Hole), `ollama-gemma4-12b` |
+
+> **Do not put `gpt4o-vision` back.** On this LiteLLM it routes to
+> `openrouter/openai/gpt-4o`, so selecting it sends traffic and money to
+> OpenRouter no matter what the Rakazo-side config says. `nemotron-3-nano` and
+> `nemotron-3-super` are OpenRouter routes too. `claude-*` are metered Anthropic.
+> None of them are on this key, deliberately. Check
+> `/model/info` and read `litellm_params.model` before adding any model here:
+> the gateway name says nothing about where the request actually goes.
 
 ## Getting in
 
