@@ -27,6 +27,7 @@ import {
 } from "./pi-openai-compatible-provider.js";
 import { textContentArg } from "./tool-text.js";
 
+import { isProviderAllowed, PROVIDER_ALLOWLIST_ENV } from "./pi-models.js";
 const running = new Map<string, AbortController>();
 // Built on first use, not at module load: entry points call loadRootEnv() after
 // their imports, and ESM hoists those imports, so module-level env reads here
@@ -95,6 +96,17 @@ export class PiAgentRuntime implements AgentRuntime {
           request.model.id === "scripted"
             ? envDefaultModel || "deepseek/deepseek-v4-flash-0731"
             : request.model.id.trim();
+        // The catalog filter hides a disallowed provider from the picker; this
+        // refuses it on the execution path. A stored model connection made
+        // before the allowlist was tightened would otherwise keep running.
+        if (!isProviderAllowed(provider)) {
+          queue.push({
+            type: "text",
+            text: `Provider ${provider} is not enabled on this deployment (${PROVIDER_ALLOWLIST_ENV}).`,
+          });
+          queue.push({ type: "done" });
+          return;
+        }
         const models = modelsForRequest(request, provider);
         let model = models.getModel(provider, modelId);
         if (!model && provider !== "openrouter" && provider !== OPENAI_COMPATIBLE_PROVIDER_ID) {

@@ -9,6 +9,35 @@ import {
   registerOpenAiCompatibleCatalog,
 } from "./pi-openai-compatible-provider.js";
 
+/**
+ * Providers this deployment is allowed to offer at all.
+ *
+ * Pi's built-in catalog ships every hosted provider it knows about, so a
+ * deployment that routes all model traffic through one gateway still shows the
+ * operator a picker full of OpenRouter, Anthropic and OpenAI entries. That is
+ * not a cosmetic problem: anyone with workspace access can paste a key and
+ * start spending on a provider the deployment was never meant to touch, and
+ * traffic that was supposed to be observable at the gateway silently is not.
+ *
+ * Comma-separated provider ids. Unset keeps the full catalog, which is the
+ * upstream default.
+ */
+export const PROVIDER_ALLOWLIST_ENV = "RAKAZO_PROVIDER_ALLOWLIST";
+
+export function allowedProviderIds(): ReadonlySet<string> | undefined {
+  const ids = (process.env[PROVIDER_ALLOWLIST_ENV] ?? "")
+    .split(",")
+    .map((id) => id.trim())
+    .filter((id) => id.length > 0);
+  return ids.length ? new Set(ids) : undefined;
+}
+
+/** Whether this deployment may use `provider` at all. */
+export function isProviderAllowed(provider: string): boolean {
+  const allowed = allowedProviderIds();
+  return !allowed || allowed.has(provider.trim());
+}
+
 export type PiCatalogAuth = "api-key" | "oauth" | "both";
 
 export type PiCatalogEntry = {
@@ -36,8 +65,10 @@ let cachedCatalog: PiCatalogEntry[] | undefined;
 
 function buildPiCatalog(): PiCatalogEntry[] {
   const models = registerOpenAiCompatibleCatalog(registerLocalProvider(builtinModels()));
+  const allowed = allowedProviderIds();
   const entries: PiCatalogEntry[] = [];
   for (const provider of models.getProviders()) {
+    if (allowed && !allowed.has(provider.id)) continue;
     const apiKey = Boolean(provider.auth.apiKey);
     const oauth = Boolean(provider.auth.oauth);
     const auth: PiCatalogAuth = apiKey && oauth ? "both" : oauth ? "oauth" : "api-key";
@@ -75,7 +106,9 @@ function buildPiCatalog(): PiCatalogEntry[] {
   if (
     envDefaultProvider === "openrouter" &&
     envDefaultModel &&
-    !models.getModel("openrouter", envDefaultModel)
+    !models.getModel("openrouter", envDefaultModel) &&
+    // Never synthesise an OpenRouter entry the allowlist just filtered out.
+    (!allowed || allowed.has("openrouter"))
   ) {
     entries.unshift({
       provider: "openrouter",
