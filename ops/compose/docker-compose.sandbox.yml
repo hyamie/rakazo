@@ -79,11 +79,13 @@ services:
 
   api:
     environment:
-      # Every model reaches this deployment through LiteLLM on node-1 and nothing
-      # else. Without this the picker still lists OpenRouter, Anthropic and
-      # OpenAI, and anyone with workspace access could paste a key and spend on a
-      # provider that bypasses the gateway entirely.
-      RAKAZO_PROVIDER_ALLOWLIST: ${RAKAZO_PROVIDER_ALLOWLIST:-openai-compatible}
+      # Every model reaches this deployment through the LiteLLM gateway on
+      # node-1 and nothing else. The gateway is wired as Rakazo's `local`
+      # provider (RAKAZO_LOCAL_MODELS_URL), per dev-infra's
+      # docs/rakazo-llm-access-prompt.md. Without this the picker still lists
+      # OpenRouter, Anthropic and OpenAI, and anyone with workspace access could
+      # paste a key and spend on a provider that bypasses the gateway entirely.
+      RAKAZO_PROVIDER_ALLOWLIST: ${RAKAZO_PROVIDER_ALLOWLIST:-local}
       SANDBOX_PROVIDER: docker
       SANDBOX_SUPERVISOR_URL: http://supervisor:7091
       SANDBOX_SUPERVISOR_TOKEN: ${SANDBOX_SUPERVISOR_TOKEN:?Set SANDBOX_SUPERVISOR_TOKEN in .env}
@@ -98,7 +100,7 @@ services:
 
   worker:
     environment:
-      RAKAZO_PROVIDER_ALLOWLIST: ${RAKAZO_PROVIDER_ALLOWLIST:-openai-compatible}
+      RAKAZO_PROVIDER_ALLOWLIST: ${RAKAZO_PROVIDER_ALLOWLIST:-local}
       SANDBOX_PROVIDER: docker
       SANDBOX_SUPERVISOR_URL: http://supervisor:7091
       SANDBOX_SUPERVISOR_TOKEN: ${SANDBOX_SUPERVISOR_TOKEN:?Set SANDBOX_SUPERVISOR_TOKEN in .env}

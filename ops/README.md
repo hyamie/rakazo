@@ -86,51 +86,63 @@ and opt-out via `"0"`, `"none"` or `"unlimited"`.
 
 ## Models
 
-Every model reaches this deployment through **LiteLLM on `192.168.10.11:4000`
-and nothing else**. `RAKAZO_PROVIDER_ALLOWLIST=openai-compatible` enforces it in
-two places: the picker never lists another provider, and the runtime refuses one
-before resolving a model, so a connection stored earlier cannot keep billing.
+Wired per dev-infra `docs/rakazo-llm-access-prompt.md`. Everything goes through
+the LiteLLM gateway at `192.168.10.11:4000`, attached as Rakazo's **`local`**
+provider, and `RAKAZO_PROVIDER_ALLOWLIST=local` makes that the only provider the
+picker offers and the only one the runtime will execute.
 
-The virtual key is `LiteLLM - VKey Rakazo` in the 1Password `ClaudeAgents`
-vault, scoped to two lanes and nothing else:
+```
+RAKAZO_LOCAL_MODELS_URL=http://192.168.10.11:4000/v1
+RAKAZO_LOCAL_MODELS=chatgpt-terra,chatgpt-sol,chatgpt-luna,chatgpt-5.5,chatgpt-5.4,
+                    gx10-fast,gx10-coder,nemotron-tool-worker,ollama-gemma4-12b
+RAKAZO_LOCAL_MODELS_API_KEY=<the `rakazo` virtual key>
+RAKAZO_LOCAL_MAX_TOKENS=4096
+```
 
-| Lane | Models |
-|---|---|
-| ChatGPT Pro subscription | `chatgpt-sol`, `chatgpt-terra` — **currently failing**, see below |
-| Local hardware | `gx10-fast`, `gx10-coder` (vLLM on the GX10), `ollama-qwen3-5-35b-a3b`, `ollama-qwen3-5-9b` (19th Hole), **`ollama-gemma4-12b`** (Ollama on node-1) |
+The key is `LiteLLM - VKey Rakazo` in the 1Password `ClaudeAgents` vault. Its
+scope is exactly those nine; any other name is refused at the gateway, which is
+intentional.
+
+Two things had to change in Rakazo itself to make this work:
+
+- **`feat/local-provider-api-key`.** `localProvider()` hardcoded
+  `apiKey: "local"` because a bare Ollama ignores the header. This gateway does
+  not: it answers `401 LiteLLM Virtual Key expected`. Without an env override
+  every model behind it is unreachable no matter how the URL is set.
+- **`feat/provider-allowlist`.** Otherwise the picker still lists OpenRouter,
+  Anthropic and OpenAI.
+
+`RAKAZO_LOCAL_MAX_TOKENS=4096` is not arbitrary: `nemotron-tool-worker` has
+reasoning permanently on, and below roughly 1100 completion tokens the whole
+budget goes to reasoning and it returns empty content with
+`finish_reason: length` and no error.
+
+Streaming needs no configuration. Doc rule 1 requires `stream: true` on the five
+`chatgpt-*` groups or they return an empty completion silently, and pi-ai's
+`openai-completions` API sets it unconditionally.
 
 ### Vision
 
-Computer use sends a screenshot every step, so a bot that cannot see cannot
-drive a computer at all. **`ollama-gemma4-12b` is the only vision-capable model
-on an approved lane**, and it runs on Mike's own hardware, so screenshots of his
-desktop never leave the house and cost nothing. It is both `PI_DEFAULT_MODEL`
-and the sole entry in `RAKAZO_OPENAI_COMPATIBLE_VISION_MODELS`.
+Computer use sends a screenshot every step, so this decides whether a bot can
+drive a computer at all. Measured across all nine groups through the gateway,
+not assumed:
 
-That was measured, not assumed. A single correct answer on one image proves
-nothing, so the check was three solid-colour PNGs through the gateway:
+| group | sees | evidence |
+|---|---|---|
+| `gx10-fast`, `gx10-coder` | yes | 4/4 exact (blue, red, yellow, green) **and** a no-image negative control returned "Black", so it is reading pixels rather than pattern-matching the prompt |
+| `chatgpt-terra` | yes | 3/3 exact |
+| `chatgpt-sol`, `chatgpt-luna`, `chatgpt-5.5`, `chatgpt-5.4` | yes | 1/1 each, corroborating terra's 3/3 across the same family |
+| `ollama-gemma4-12b` | yes | 3/3 correct hue with a consistent darkness bias (Maroon / Navy / Olive) |
+| `nemotron-tool-worker` | **no** | `InternalServerError` on image content |
 
-```
-red    (220,0,0)   -> "Maroon"
-blue   (0,0,220)   -> "Navy"
-yellow (230,230,0) -> "Olive"
-```
+`RAKAZO_LOCAL_VISION_MODELS` therefore lists all of them except
+`nemotron-tool-worker`.
 
-Three for three on hue with a consistent darkness bias. A model guessing would
-not track hue across all three; the bias itself does not matter for reading UI.
-
-The `gx10-*` (`qwen3.8-27b`) and `ollama-qwen3-5-*` models are text-only, and
-the ChatGPT lane rejects image content **and plain text** with
-`ChatgptException - Unknown items in responses API response: []`. That is a
-LiteLLM-side fault and is Mike's to fix; nothing here works around it.
-
-> **Do not put `gpt4o-vision` back.** On this LiteLLM it routes to
-> `openrouter/openai/gpt-4o`, so selecting it sends traffic and money to
-> OpenRouter no matter what the Rakazo-side config says. `nemotron-3-nano` and
-> `nemotron-3-super` are OpenRouter routes too. `claude-*` are metered Anthropic.
-> None of them are on this key, deliberately. Check
-> `/model/info` and read `litellm_params.model` before adding any model here:
-> the gateway name says nothing about where the request actually goes.
+**Prefer `gx10-fast` for computer use.** It is the only vision model that is
+both free and local, so a bot can take a screenshot per step without touching
+the shared ChatGPT Pro quota, and screenshots of Mike's desktop never leave the
+LAN. Doc rule 3 says anything on a loop belongs on the local groups, and a bot
+driving a computer is exactly a loop.
 
 ## Getting in
 
