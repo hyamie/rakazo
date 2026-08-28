@@ -242,6 +242,78 @@ credential itself incapable of writing rather than relying on the server to
 withhold the tools. Minting one is UI-only, so it is Mike's to do; swapping it in
 afterwards is a single `secrets` row.
 
+## The project trees
+
+Carl reads Mike's live working trees, including uncommitted and unpushed work.
+qmd is markdown-only and reindexes about daily; GitHub is stale since the last
+push. Neither shows what is on disk right now, which is the thing worth seeing.
+
+| | |
+|---|---|
+| `/mnt/projects` | `~/hyamie/projects` from RipOrDie over NFS, **read-only** |
+| `/mnt/work` | `/var/rakazo/botwork` on the VM, **writable** scratch |
+
+Wired by `RAKAZO_COMPUTER_EXTRA_MOUNTS` on the supervisor, which passes them to
+every bot computer it creates. The bot's existing `shell`, `read_file` and
+`list_files` tools see both; no new tools were needed.
+
+### Why read-only plus a scratch, and not worktrees
+
+The instinct is "let it write, but only in worktrees". That does not work, and it
+is worth knowing why before someone tries it again.
+
+`git worktree add` writes into the **source** repository: it creates a branch ref
+and `.git/worktrees/<id>/` metadata there. Against a read-only source it fails
+with `cannot lock ref ... Permission denied`. So allowing worktrees means
+granting write access to the real `.git`, which is exactly the access that lets
+an agent `git reset --hard` someone's working tree. Worktree discipline would be
+a convention the agent is trusted to follow, and a convention is what fails.
+
+`git clone` from a read-only source works, and the clone is fully writable:
+branch, commit, rewrite history, whatever. Same isolation, enforced by the mount
+instead of by the agent's good behaviour. So the bot reads `/mnt/projects`,
+clones what it wants into `/mnt/work`, and works there. Getting anything back is
+then a deliberate act by a human, not a side effect of an agent being wrong.
+
+### The read-only property is three-deep
+
+The computer image has no `USER` directive, so **the bot runs as root inside its
+container**. Read-only therefore cannot rest on file permissions:
+
+- the NFS export is `ro` and `all_squash,anonuid=1000`, so every request from the
+  VM lands as `hyamie` no matter what uid made it. The bot sees precisely what
+  Mike can read, and the server refuses writes.
+- the guest mount is `ro,nosuid,nodev,noexec`.
+- the container bind is `:ro`.
+
+Verified rather than assumed: `touch /mnt/projects/EVIL` as root on the VM
+returns `Read-only file system`.
+
+### Both targets are outside /home/rakazo, deliberately
+
+`/home/rakazo` is the portable workspace, and `AgentHomeStore` checkpoints it
+into `DATA_DIR` at every run completion, failure, explicit stop and idle
+suspension. Mounting a 64 GB tree inside it would walk and copy that tree on
+every run boundary. `computerExtraMounts()` refuses such a target outright rather
+than leaving it as a footgun; `/home/rakazo-extra` is still allowed, and a test
+pins that, because a naive `startsWith` would wrongly reject it.
+
+### Operating it
+
+```bash
+# on RipOrDie
+sudo exportfs -v                      # the export, scoped to 192.168.10.30 only
+# on the VM
+findmnt /mnt/projects                 # the guest mount
+sudo ls /var/rakazo/botwork           # what the bot has cloned
+```
+
+`nofail` and `soft` are on the guest mount on purpose: if RipOrDie is down the
+bot loses sight of the trees, rather than the VM hanging at boot or a container
+wedging on an uninterruptible NFS wait. `/var/rakazo/botwork` is a plain host
+directory, not a Compose volume, so `docker compose down -v` leaves it alone; it
+is also not in any backup unless someone adds it.
+
 ## Getting in
 
 **Web UI: `https://192.168.10.30`** from Main or over the Road-Warrior VPN. The
