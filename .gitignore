@@ -44,3 +44,6 @@ apps/web/scripts/msgids.json
 
 # Local agent session state (not upstream)
 .claude/
+
+# LAN gateway certificate: deployment data, copied to the host out of band.
+ops/certs/

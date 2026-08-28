@@ -158,6 +158,57 @@ the shared ChatGPT Pro quota, and screenshots of Mike's desktop never leave the
 LAN. Doc rule 3 says anything on a loop belongs on the local groups, and a bot
 driving a computer is exactly a loop.
 
+## qmd
+
+Carl reaches the qmd index (75k markdown docs across the Obsidian brain, the
+project trees, claude-env, koby-comms) as an MCP server. The gateway is Caddy on
+RipOrDie `192.168.10.117`, bearer-auth in front of a qmd HTTP server bound to
+localhost. Token lives in 1Password, `ClaudeAgents` / "QMD HTTP Gateway".
+
+Endpoint: `https://192.168.10.117:8443/mcp`, streamable HTTP.
+
+Three things had to be true, and none of them were:
+
+**The connector guard refuses private addresses.** By design, at four layers in
+`packages/adapters/src/remote-mcp.ts`: HTTPS-only, `isPrivateHostname()` on the
+URL, `assertPublicAddresses()` on the resolution, and the same address check
+again inside the undici connect lookup so a name that re-resolves after
+validation still cannot land on 10.x. On the hosted product that is correct and
+must stay. A self-hosted install inverts the premise: its MCP servers are on the
+same switch and reaching a private address is the requirement, not the attack.
+`RAKAZO_MCP_LAN_ALLOWLIST` (`host` or `host:port`, comma-separated) names the
+hosts this deployment trusts. Unset keeps the refusal, so upstream is unchanged.
+A listed host relaxes plain HTTP and the private-address rule for itself only:
+redirects stay refused, so it cannot bounce a request onto an unlisted host, and
+the connect-time check stays armed everywhere else, which is what keeps DNS
+rebinding closed.
+
+**`McpRemoteEndpointSchema` requires https.** That is the fifth layer and it sits
+in `packages/contracts`, so it rejects a plain-HTTP endpoint at the API before
+the adapter is ever reached. Rather than weaken a shared contract, the gateway
+grew a TLS listener on `:8443`. `:8181` is untouched and every existing consumer
+keeps working; retire it only once they have all moved.
+
+**A LAN IP cannot hold a public certificate.** `:8443` is self-signed with an IP
+SAN for `192.168.10.117`, and is therefore its own CA. `api` and `worker` mount
+that one file and set `NODE_EXTRA_CA_CERTS`, which scopes the added trust to
+exactly one host instead of rewriting the system store. Side benefit worth having
+on its own: the bearer token no longer crosses the LAN in cleartext to reach an
+index that holds personal and client data.
+
+The certificate is deployment data, not source. `ops/certs/` is gitignored;
+copy it to the host out of band:
+
+```bash
+scp ~/.config/qmd-gateway/qmd-gateway.crt rakazo-vm:/opt/rakazo/ops/certs/
+```
+
+If that file is missing, Docker creates a **directory** at the bind source
+instead of failing, Node ignores a non-file `NODE_EXTRA_CA_CERTS`, and the only
+symptom is a TLS error on the first MCP call. Check the path before blaming the
+gateway. The certificate expires 2036-08-25; regenerating it means reissuing with
+the same IP SAN and recopying.
+
 ## Getting in
 
 **Web UI: `https://192.168.10.30`** from Main or over the Road-Warrior VPN. The

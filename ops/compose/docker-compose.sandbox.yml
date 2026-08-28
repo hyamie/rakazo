@@ -103,6 +103,19 @@ services:
       # worth the exposure, and its official path refuses anyway while only a
       # v0.1.0-beta prerelease tag exists.
       RAKAZO_UPDATER_URL: ""
+      NODE_EXTRA_CA_CERTS: /etc/ssl/rakazo/qmd-gateway.crt
+    # The qmd MCP gateway on RipOrDie is addressed by LAN IP, which can never hold
+    # a publicly-issued certificate, so its TLS front is self-signed and therefore
+    # its own CA. Node is pointed at that one file rather than the system trust
+    # store being rewritten, which keeps the trust scoped to exactly one host.
+    #
+    # The certificate is deployment data, not source: ops/certs/ is gitignored and
+    # the file is copied to the host out of band (see ops/README.md). If it is
+    # missing, Docker silently creates a DIRECTORY at the source path instead of
+    # failing, Node ignores a non-file NODE_EXTRA_CA_CERTS, and the only symptom is
+    # a TLS error on the first MCP call. Check this path before blaming the gateway.
+    volumes:
+      - ../../ops/certs/qmd-gateway.crt:/etc/ssl/rakazo/qmd-gateway.crt:ro
     depends_on:
       supervisor:
         condition: service_started
@@ -113,6 +126,19 @@ services:
       SANDBOX_PROVIDER: docker
       SANDBOX_SUPERVISOR_URL: http://supervisor:7091
       SANDBOX_SUPERVISOR_TOKEN: ${SANDBOX_SUPERVISOR_TOKEN:?Set SANDBOX_SUPERVISOR_TOKEN in .env}
+      NODE_EXTRA_CA_CERTS: /etc/ssl/rakazo/qmd-gateway.crt
+    # The qmd MCP gateway on RipOrDie is addressed by LAN IP, which can never hold
+    # a publicly-issued certificate, so its TLS front is self-signed and therefore
+    # its own CA. Node is pointed at that one file rather than the system trust
+    # store being rewritten, which keeps the trust scoped to exactly one host.
+    #
+    # The certificate is deployment data, not source: ops/certs/ is gitignored and
+    # the file is copied to the host out of band (see ops/README.md). If it is
+    # missing, Docker silently creates a DIRECTORY at the source path instead of
+    # failing, Node ignores a non-file NODE_EXTRA_CA_CERTS, and the only symptom is
+    # a TLS error on the first MCP call. Check this path before blaming the gateway.
+    volumes:
+      - ../../ops/certs/qmd-gateway.crt:/etc/ssl/rakazo/qmd-gateway.crt:ro
     # The worker drives the run loop and therefore talks to the supervisor, so it
     # needs `control` on top of the app/data it gets from the prod file. Upstream
     # does not list it because upstream's worker uses e2b and never calls a
