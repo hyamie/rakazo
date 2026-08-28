@@ -224,6 +224,47 @@ describe("transport URL policy", () => {
     });
   });
 
+  // The shape this deployment actually runs: TLS to a LAN gateway. Unlike the
+  // plain-HTTP case it does NOT bypass createSafeRemoteFetch, so it has to clear
+  // assertSafeRemoteUrl and the connect-time address check as well as validateUrl.
+  it("admits HTTPS to a listed private host through the full safe-fetch path", async () => {
+    await withEnv("192.168.10.117:8443", async () => {
+      const { secureFetch } = await import("./mcp-transport.js");
+      const url = new URL("https://192.168.10.117:8443/mcp");
+      let reached = false;
+      const fetchImpl = secureFetch(
+        url,
+        {},
+        { headers: { Authorization: "Bearer token" } },
+        {
+          fetch: async () => {
+            reached = true;
+            return new Response("ok");
+          },
+          resolveHostname: resolvePrivate,
+        },
+      );
+      await expect(fetchImpl(url).then((r) => r.text())).resolves.toBe("ok");
+      expect(reached).toBe(true);
+      await fetchImpl.close();
+    });
+  });
+
+  it("still refuses HTTPS to an unlisted private host on that same path", async () => {
+    await withEnv("192.168.10.117:8443", async () => {
+      const { secureFetch } = await import("./mcp-transport.js");
+      const url = new URL("https://192.168.10.11:4000/mcp");
+      const fetchImpl = secureFetch(
+        url,
+        {},
+        {},
+        { fetch: async () => new Response("ok"), resolveHostname: resolvePrivate },
+      );
+      await expect(fetchImpl(url)).rejects.toThrow(/private host/);
+      await fetchImpl.close();
+    });
+  });
+
   it("still refuses a redirect from a listed host", async () => {
     await withEnv("192.168.10.117:8181", async () => {
       const { secureFetch } = await import("./mcp-transport.js");
