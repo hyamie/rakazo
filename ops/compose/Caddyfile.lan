@@ -15,6 +15,16 @@
 {
 	local_certs
 
+	# No HTTP/3. Caddy advertises `alt-svc: h3=":443"`, so after the first load a
+	# browser switches to QUIC, and a manually accepted certificate exception does
+	# not carry over to it. The page keeps working while individual fetches fail
+	# with a bare "Failed to fetch" and nothing reaches the server log, which is
+	# indistinguishable from a network fault. Drop this once Caddy's root CA is
+	# actually trusted on the client, at which point h3 is fine.
+	servers {
+		protocols h1 h2
+	}
+
 	# Browsers and curl send no SNI when the address bar holds a bare IP (RFC 6066
 	# forbids an IP literal in server_name). With no SNI and no default, Caddy has
 	# no site to match and the TLS handshake simply hangs: port 443 accepts the
