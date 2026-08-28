@@ -209,6 +209,39 @@ symptom is a TLS error on the first MCP call. Check the path before blaming the
 gateway. The certificate expires 2036-08-25; regenerating it means reissuing with
 the same IP SAN and recopying.
 
+## GitHub
+
+Carl reads the repos through GitHub's hosted MCP server. The endpoint is public
+HTTPS, so none of the LAN work above applies to it and no allowlist entry is
+needed.
+
+Endpoint: `https://api.githubcopilot.com/mcp/readonly`, streamable HTTP. The
+token is the existing PAT in 1Password, `ClaudeAgents` / "GitHub Personal Access
+Token", **`credential` field**. The item also carries a `Token` field, which is
+dead: it returns 401 against `api.github.com/user` while `credential` returns 200.
+
+**The read-only scope is in the URL, deliberately.** That PAT carries full `repo`
+write across 124 repositories, so the bot's tool surface is what bounds it: the
+`/readonly` path serves 27 tools and none of them write, against 44 with 13
+write-shaped on the default path. Measured, not assumed.
+
+The obvious alternative, sending `X-MCP-Readonly: true` as a configured header,
+**does not work and fails silently**. `secureFetch` in
+`packages/adapters/src/mcp-transport.ts` filters configured headers against
+`DEFAULT_HEADERS`, which is `accept`, `content-type`, `authorization`,
+`user-agent`, and `McpConnector` never passes an `allowedHeaders` policy. So
+every custom header a user configures is dropped before the request goes out,
+while `mcp_servers.headers` faithfully records that they set it. Any API-key
+header (`X-API-Key` and friends) is silently never sent. That is an upstream bug
+worth reporting; it is not worked around here because the URL form is better
+anyway, being a property of the endpoint rather than of a header the server may
+or may not honour.
+
+The cleaner long-term answer is a fine-grained read-only PAT, which makes the
+credential itself incapable of writing rather than relying on the server to
+withhold the tools. Minting one is UI-only, so it is Mike's to do; swapping it in
+afterwards is a single `secrets` row.
+
 ## Getting in
 
 **Web UI: `https://192.168.10.30`** from Main or over the Road-Warrior VPN. The
