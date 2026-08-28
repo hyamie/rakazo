@@ -55,6 +55,26 @@ services:
       SUPERVISOR_PORT: "7091"
       DOCKER_SOCKET: /var/run/docker.sock
       RAKAZO_COMPUTER_IMAGE: rakazo/computer:local
+      # What the bot can see of the host, beyond its own workspace.
+      #
+      # /mnt/projects is Mike's live project trees, NFS from RipOrDie. It is
+      # read-only at three independent layers: the server export is `ro`, the
+      # guest mount is `ro`, and this bind is `ro`. That matters because the
+      # computer image has no USER directive, so the bot runs as root inside its
+      # container; the export's all_squash pins it to uid 1000 regardless, so it
+      # reads exactly what Mike can read and can write nothing.
+      #
+      # Writes go to /mnt/work instead. The bot clones a repo out of the
+      # read-only tree and commits on its own branch there, which is the
+      # isolation a worktree would give without handing it write access to the
+      # real .git. `git worktree add` cannot work against a read-only source: it
+      # has to create a ref in the source repo and fails with "cannot lock ref".
+      #
+      # Both targets are deliberately outside /home/rakazo. That directory is the
+      # portable workspace and AgentHomeStore copies it into DATA_DIR at every run
+      # boundary, so a 64 GB tree mounted inside it would be walked and copied on
+      # every run. computerExtraMounts() refuses such a target outright.
+      RAKAZO_COMPUTER_EXTRA_MOUNTS: ${RAKAZO_COMPUTER_EXTRA_MOUNTS:-/mnt/projects:/mnt/projects:ro,/var/rakazo/botwork:/mnt/work:rw}
       # The screen URL is loaded by a browser on Mike's laptop, not from inside
       # the compose network, so the supervisor must hand back the published host
       # mapping. Leaving SANDBOX_SCREEN_NETWORK unset keeps that default; the

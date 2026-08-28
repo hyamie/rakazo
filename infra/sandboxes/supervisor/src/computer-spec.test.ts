@@ -3,6 +3,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   COMPUTER_IMAGE,
+  computerExtraMounts,
   computerNetworkNameFor,
   computerNetworkNamesForCleanup,
   containerCreateOptions,
@@ -274,9 +275,7 @@ describe("computer screen bind host", () => {
     vi.resetModules();
     const { computerPortBindings } = await import("./computer-spec.js");
     const { PortBindings } = computerPortBindings();
-    const hosts = new Set(
-      Object.values(PortBindings).flatMap((bs) => bs.map((b) => b.HostIp)),
-    );
+    const hosts = new Set(Object.values(PortBindings).flatMap((bs) => bs.map((b) => b.HostIp)));
     expect([...hosts]).toEqual(["172.17.0.1"]);
   });
 
@@ -287,5 +286,75 @@ describe("computer screen bind host", () => {
     const { PortBindings, ExposedPorts } = computerPortBindings();
     expect(Object.keys(PortBindings)).toHaveLength(TEAM_SCREEN_LIMIT * 2);
     expect(Object.keys(ExposedPorts)).toHaveLength(TEAM_SCREEN_LIMIT * 2);
+  });
+});
+
+describe("computer extra mounts", () => {
+  it("adds nothing when unset, leaving the workspace bind alone", () => {
+    expect(computerExtraMounts(undefined)).toEqual([]);
+    expect(computerExtraMounts("")).toEqual([]);
+  });
+
+  it("defaults an entry without a mode to read-only", () => {
+    expect(computerExtraMounts("/mnt/projects:/mnt/projects")).toEqual([
+      { source: "/mnt/projects", target: "/mnt/projects", readOnly: true },
+    ]);
+  });
+
+  it("reads a named volume and an explicit mode, and trims blanks", () => {
+    expect(
+      computerExtraMounts(" /mnt/projects:/mnt/projects:ro , rakazo-work:/mnt/work:rw ,, "),
+    ).toEqual([
+      { source: "/mnt/projects", target: "/mnt/projects", readOnly: true },
+      { source: "rakazo-work", target: "/mnt/work", readOnly: false },
+    ]);
+  });
+
+  // The guard that matters: /home/rakazo is checkpointed into DATA_DIR at every
+  // run boundary, so a large tree mounted inside it would be copied each time.
+  it("refuses a target inside the checkpointed workspace", () => {
+    expect(() => computerExtraMounts("/mnt/projects:/home/rakazo/projects")).toThrow(
+      /checkpointed on every run boundary/,
+    );
+    expect(() => computerExtraMounts("/mnt/projects:/home/rakazo")).toThrow(
+      /checkpointed on every run boundary/,
+    );
+  });
+
+  it("allows a target that merely shares a prefix with the workspace", () => {
+    expect(computerExtraMounts("/mnt/x:/home/rakazo-extra")).toEqual([
+      { source: "/mnt/x", target: "/home/rakazo-extra", readOnly: true },
+    ]);
+  });
+
+  it("refuses a malformed entry rather than silently skipping it", () => {
+    expect(() => computerExtraMounts("/mnt/projects")).toThrow(/source:target/);
+    expect(() => computerExtraMounts("/mnt/projects:/mnt/p:ro:extra")).toThrow(/source:target/);
+    expect(() => computerExtraMounts("/mnt/projects:relative")).toThrow(/must be absolute/);
+    expect(() => computerExtraMounts(":/mnt/p")).toThrow(/empty side/);
+    expect(() => computerExtraMounts("/mnt/projects:/mnt/p:rx")).toThrow(/must be ro or rw/);
+  });
+
+  it("appends the mounts after the workspace bind on the container spec", () => {
+    const previous = process.env.RAKAZO_COMPUTER_EXTRA_MOUNTS;
+    process.env.RAKAZO_COMPUTER_EXTRA_MOUNTS =
+      "/mnt/projects:/mnt/projects:ro,rakazo-work:/mnt/work:rw";
+    try {
+      const input = {
+        name: "rakazo-bot-x",
+        image: "rakazo/computer:local",
+        botId: "bot-x",
+        workspaceId: "ws-1",
+        homePath: "/data/homes/bot-x",
+      };
+      expect(containerCreateOptions(input).HostConfig.Binds).toEqual([
+        "/data/homes/bot-x:/home/rakazo",
+        "/mnt/projects:/mnt/projects:ro",
+        "rakazo-work:/mnt/work:rw",
+      ]);
+    } finally {
+      if (previous === undefined) delete process.env.RAKAZO_COMPUTER_EXTRA_MOUNTS;
+      else process.env.RAKAZO_COMPUTER_EXTRA_MOUNTS = previous;
+    }
   });
 });

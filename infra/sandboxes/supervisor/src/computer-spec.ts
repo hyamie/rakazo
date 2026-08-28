@@ -111,6 +111,59 @@ export function computerResourceLimits() {
   };
 }
 
+const WORKSPACE_ROOT = "/home/rakazo";
+
+export type ExtraMount = { source: string; target: string; readOnly: boolean };
+
+/**
+ * Host paths and named volumes mounted into every bot computer beyond its own
+ * workspace, from RAKAZO_COMPUTER_EXTRA_MOUNTS.
+ *
+ * Entries are `source:target` or `source:target:ro|rw`, comma-separated. Unset
+ * gives a computer exactly the one workspace bind it has always had.
+ *
+ * The target may not be inside /home/rakazo, and that is a correctness rule
+ * rather than tidiness. /home/rakazo is the portable workspace: AgentHomeStore
+ * checkpoints it into DATA_DIR at every run completion, failure, explicit stop
+ * and idle suspension. A read-only host tree mounted inside it would be walked
+ * and copied on every one of those boundaries, so pointing a large source there
+ * turns each run boundary into a full copy of it. Mount siblings instead, e.g.
+ * /mnt/projects.
+ */
+export function computerExtraMounts(
+  raw: string | undefined = process.env.RAKAZO_COMPUTER_EXTRA_MOUNTS,
+): ExtraMount[] {
+  return (raw ?? "")
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0)
+    .map((entry) => {
+      const parts = entry.split(":");
+      if (parts.length < 2 || parts.length > 3) {
+        throw new Error(
+          `RAKAZO_COMPUTER_EXTRA_MOUNTS entry must be source:target[:ro|rw], got "${entry}"`,
+        );
+      }
+      const [source, target, mode = "ro"] = parts as [string, string, string?];
+      if (!source || !target) {
+        throw new Error(`RAKAZO_COMPUTER_EXTRA_MOUNTS entry has an empty side: "${entry}"`);
+      }
+      if (!target.startsWith("/")) {
+        throw new Error(`RAKAZO_COMPUTER_EXTRA_MOUNTS target must be absolute: "${target}"`);
+      }
+      if (target === WORKSPACE_ROOT || target.startsWith(`${WORKSPACE_ROOT}/`)) {
+        throw new Error(
+          `RAKAZO_COMPUTER_EXTRA_MOUNTS target "${target}" is inside ${WORKSPACE_ROOT}, which is ` +
+            "checkpointed on every run boundary; mount it as a sibling instead",
+        );
+      }
+      if (mode !== "ro" && mode !== "rw") {
+        throw new Error(`RAKAZO_COMPUTER_EXTRA_MOUNTS mode must be ro or rw, got "${mode}"`);
+      }
+      return { source, target, readOnly: mode === "ro" };
+    });
+}
+
 export function screenPorts(index: number) {
   if (index < 0 || index >= TEAM_SCREEN_LIMIT) {
     throw new Error(
@@ -182,7 +235,10 @@ export function containerCreateOptions(input: ComputerCreateInput) {
     },
     ExposedPorts: ports.ExposedPorts,
     HostConfig: {
-      Binds: [`${input.homePath}:/home/rakazo`],
+      Binds: [
+        `${input.homePath}:/home/rakazo`,
+        ...computerExtraMounts().map((m) => `${m.source}:${m.target}:${m.readOnly ? "ro" : "rw"}`),
+      ],
       PortBindings: ports.PortBindings,
       ShmSize: 256 * 1024 * 1024,
       ...computerResourceLimits(),
