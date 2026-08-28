@@ -18,11 +18,24 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-liberation \
     fonts-dejavu-core \
     dbus-x11 \
+    git \
+    ripgrep \
+    less \
   && rm -rf /var/lib/apt/lists/* \
   && mkdir -p /etc/rakazo/fluxbox \
   && printf '%s\n' '#!/bin/sh' 'exec xsetroot -solid "#111113" "$@"' > /usr/bin/fbsetbg \
   && chmod +x /usr/bin/fbsetbg \
   && ln -sfn /bin/true /usr/bin/xmessage
+# git refuses to touch a repository owned by another user ("detected dubious
+# ownership"). This image has no USER directive, so the agent runs as root, while
+# host trees mounted in arrive owned by whoever owns them outside (uid 1000 over
+# the NFS export). Without this, every `git log` and `git clone` against a mounted
+# tree fails, which reads as a broken mount rather than a git policy.
+#
+# The check is a multi-tenant protection and this container is single-tenant and
+# disposable, so waiving it wholesale is the right scope. It grants no write
+# ability: a read-only mount stays read-only.
+RUN git config --system --add safe.directory '*'
 ENV DISPLAY=:1
 ENV HOME=/home/rakazo
 WORKDIR /home/rakazo
