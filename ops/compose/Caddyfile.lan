@@ -1,4 +1,4 @@
-# LAN Caddyfile for the VLAN 60 deployment.
+# LAN Caddyfile for the LAN deployment.
 #
 # The upstream Caddyfile.prod takes a bare hostname and defaults it to
 # app.example.com, which makes Caddy attempt a public ACME issuance. There is no
@@ -31,10 +31,10 @@
 	# connection and nothing ever comes back, which reads as a network block
 	# rather than a config problem. This pins the fallback to the IP site, whose
 	# certificate carries the matching IP SAN.
-	default_sni 192.168.60.10
+	default_sni 192.168.10.30
 }
 
-https://192.168.60.10, https://rakazo.sandbox.lan {
+https://192.168.10.30, https://rakazo.sandbox.lan {
 	encode zstd gzip
 
 	handle /health {

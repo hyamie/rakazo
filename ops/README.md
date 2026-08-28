@@ -13,7 +13,7 @@ and are carried as branches instead, each shaped as an upstream PR.
 | Resources | 12 GB fixed (no balloon), 2 vCPU, 150 GB |
 | CPU model | `x86-64-v3`, not `host`, so it can migrate cluster-wide |
 | Disk | `extra-storage` (`/dev/sda`, SATA SSD, own VG) |
-| Network | VLAN 60 `AI-Sandbox`, `192.168.60.10/24`, gateway `.1` |
+| Network | VLAN 10 `Main`, `192.168.10.30/24`, gateway `.1` (see `network.md`) |
 | Checkout | `/opt/rakazo`, branch `deploy/hds` |
 | Secrets | `/opt/rakazo/.env`, mode 600, generated at deploy |
 
@@ -160,7 +160,7 @@ driving a computer is exactly a loop.
 
 ## Getting in
 
-**Web UI: `https://192.168.60.10`** from Main or over the Road-Warrior VPN. The
+**Web UI: `https://192.168.10.30`** from Main or over the Road-Warrior VPN. The
 certificate comes from Caddy's internal CA, so the first visit warns; the root is
 at `/data/caddy/pki/authorities/local/root.crt` inside the caddy container if you
 want to trust it once. `http://` 308-redirects to `https://`.

@@ -1,98 +1,67 @@
 # Network placement
 
-Rakazo runs on **VLAN 60 `AI-Sandbox`** (`192.168.60.0/24`), created 2026-08-27.
-Nothing else lives there yet.
+Rakazo runs on **VLAN 10 `Main`** at `192.168.10.30/24`, alongside the rest of the
+dev estate. It spent 2026-08-27 to 2026-08-28 on a dedicated VLAN 60 `AI-Sandbox`;
+that is retired, and this document records why, because the reasoning is the
+reusable part.
 
-## Why a VLAN and not just the VM
+## Why it is not on its own VLAN
 
-The VM boundary contains the root-equivalent Docker socket the supervisor holds.
-The VLAN contains something different: a bot drives its own browser and shell, so
-the interesting failure is not "the host is compromised", it is "the agent was
-talked into fetching an internal URL". That is a live CVE class
-(browser-use CVE-2025-47241), and the answer to it is network policy, not a
-container boundary.
+The original argument was sound in the abstract. A bot drives its own browser and
+shell, so the interesting failure is not "the host is compromised", it is "the
+agent was talked into fetching an internal URL". That is a live CVE class
+(browser-use CVE-2025-47241), and the textbook answer is network policy rather
+than a container boundary. So Rakazo went on VLAN 60 with LiteLLM, n8n and qmd as
+the only carve-outs.
 
-## Policy
+It did not survive contact with the gateway. **The UDM's IPS silently black-holes
+inter-VLAN flows**, and it does it to whatever flow it feels like, not just the
+one you planned for:
 
-Applied on the UDM as zone-based firewall policies. All LAN networks sit in the
-**Internal** zone, including new ones: the controller exposes no API to place a
-network in `Dmz`, so the isolation is written explicitly rather than inherited.
+- First it took inter-VLAN **SSH**, matching `ET SCAN Potential SSH Scan OUTBOUND`
+  (sig 2003068) and adding the flow to its `ips` ipset with a ~5 minute timeout.
+  That was written off as SSH-specific and worked around with a ProxyJump.
+- Then on 2026-08-28 it took the **LiteLLM** flow too, `192.168.60.10 ->
+  192.168.10.11:4000`, logged as `THREAT_BLOCKED_V3` / VERY_HIGH. Which is the
+  product's only path to a model. Runs failed with `Request timed out.` while the
+  `Allow-Sandbox-to-LiteLLM` policy sat enabled with an advancing hit counter.
 
-| Idx | Policy | Effect |
-|---|---|---|
-| 10003 | `Allow-VPN-to-Sandbox` | Road-Warrior VPN reaches the sandbox, so the web UI and bot screens work from the phone and from away. No new ingress. |
-| 10022 | `Allow-Sandbox-to-LiteLLM` | → `192.168.10.11:4000/tcp` only. |
-| 10023 | `Allow-Sandbox-to-n8n` | → `192.168.10.13:5678/tcp` only. |
-| 10024 | `Block-Sandbox-to-Private` | → Core, Main, Media, IoT, Cameras, Guest: denied. NEW connections only. |
-| 10025 | `Block-Sandbox-to-Gateway-Mgmt` | → the other VLANs' gateway IPs: denied. NEW connections only. |
+The measurement that settled it: `tcpdump` on pve-node-1 caught **zero packets**
+from four connect attempts, while n8n `:5678` and qmd `:8181` from the same
+container at the same instant connected in ~1 ms, and LiteLLM answered a VLAN 10
+host 8/8. Nothing was wrong with the rule, the route, conntrack, or the host. The
+gateway was eating the flow.
 
-**Both blocks must match `NEW` connections only, and that is not a detail.** They
-were created with UniFi's default `connection_state_type: ALL`, which also
-matches the *return* leg of a connection someone else opened, because a reply
-from the sandbox to Main is still "sourced from VLAN 60". The effect was total:
-the VM stopped answering ping from Main and every HTTP request timed out, while
-the VM itself was perfectly healthy and its own outbound traffic worked. It
-reads as a dead host, not a firewall rule. If a one-directional block ever
-appears to have taken the whole host offline, check `connection_state_type`
+**The judgement call:** the isolation bought less than it appeared to. Those bots
+already have open internet egress and hold a GitHub token for ~60 private repos,
+so a bot that wants to leak something does not need lateral reach to do it. What
+the VLAN actually bought was protection against lateral movement, and it was paid
+for with a product that worked about a third of the time and a permanent
+dependency on hand-written IPS exceptions for every new service a bot needs.
+
+Accepted tradeoff: Rakazo sits on the dev VLAN. The **VM boundary is the
+containment** and it still holds the root-equivalent Docker socket the supervisor
+needs. If lateral isolation is wanted again, do it with an IPS exception in place
+from day one, not after.
+
+## Two lessons worth keeping
+
+**A one-directional block with `connection_state_type: ALL` takes the whole host
+offline.** UniFi's default matches the *return* leg of a connection someone else
+opened, because a reply from the sandbox to Main is still "sourced from VLAN 60".
+The VM stopped answering ping and every HTTP request timed out while the VM was
+perfectly healthy. It reads as a dead host, not a firewall rule. If a
+one-directional block appears to have killed a host, check `connection_state_type`
 first.
 
-Inbound from Main is untouched: every block matches only traffic **sourced** from
-VLAN 60, so a browser on Main reaches the web UI normally.
-
-Verified from inside the VM after the rules were applied:
-
-```
-LiteLLM 192.168.10.11:4000      200          n8n 192.168.10.13:5678   200
-internet github.com             200          DNS                      OK
-RipOrDie      :22   blocked     RipOrDie :8181 (qmd/PII)      blocked
-pve-node-2    :8006 blocked     Home Assistant :8123          blocked
-UDM 192.168.1.1 / .10.1 / .30.1 :443          blocked
-```
-
-Both carve-outs are port-scoped, so the rest of what those hosts run stays out
-of reach. Verified:
-
-```
-192.168.10.11:4000 LiteLLM   REACHABLE     192.168.10.13:5678 n8n     REACHABLE
-192.168.10.11:5432 Postgres  blocked       192.168.10.13:3900 garage  blocked
-192.168.10.11:8006 PVE mgmt  blocked
-```
-
-Verified from Main after the state fix, so both properties hold at once:
-
-```
-ping 192.168.60.10                 0% loss
-https://192.168.60.10/health       200  {"ok":true,...,"sandbox":"docker"}
-https://192.168.60.10/             200
-http://192.168.60.10/              308 -> https
-```
-
-## Known gap
-
-`192.168.60.1:443` is still reachable, so a bot can load the UDM management UI on
-its own gateway. Closing it needs a port-scoped pair (allow 53 and DHCP to the
-gateway zone, block the rest) rather than a flat block, because that same address
-serves the sandbox its DNS.
+**When a gateway drops traffic, read its own event log before theorising.** The
+UDM names its own action verbatim in `unifi_list_events`
+(`THREAT_BLOCKED_V3`, with source and destination). A tcpdump on the far end, the
+destination's firewall, its routing table, conntrack counters and NIC config were
+all read first, and all of them were clean, because the answer was never there.
 
 ## Getting a shell
 
-Use `ssh rakazo-vm`, which jumps via `pve-node-2`.
-
-Direct SSH to `192.168.60.10` **works and then stops working, on a cycle**. The
-UDM's IPS matches `ET SCAN Potential SSH Scan OUTBOUND` (sig 2003068) on
-inter-VLAN SSH and adds the flow to its `ips` ipset with a ~5 minute timeout.
-Sessions already open survive; the next connection times out until the entry
-ages out. Measured directly:
-
-```
-# three normal SSH sessions, five seconds apart -> all succeed, and then:
-# ipset list ips
-192.168.60.10,tcp:22,192.168.10.117 timeout 283
-# next three connections -> Connection timed out, x3
-```
-
-**This is SSH-specific.** HTTPS to the web UI kept returning 200 throughout, so
-the thing Mike actually uses is unaffected. The permanent fix is a
-signature-scoped IPS exception (the mechanism is written up for the git-over-SSH
-case in `~/projects/active/ubiquiti/docs/ips-github-ssh-fix-options.md`); it
-changes the production gateway's security posture, so it has not been applied.
+`ssh rakazo-vm` reaches `192.168.10.30` directly. The ProxyJump via `pve-node-2`
+is no longer needed: RipOrDie and the VM are on the same L2 segment, so SSH never
+crosses the gateway and the IPS never sees it.
