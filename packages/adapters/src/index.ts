@@ -36,6 +36,7 @@ export * from "./installed-connectors.js";
 export * from "./job-reconciler.js";
 export * from "./mcp-connector.js";
 export * from "./mcp-emulator.js";
+export * from "./mcp-lan-allowlist.js";
 export * from "./mcp-oauth.js";
 export * from "./mcp-server-tool.js";
 export * from "./mcp-transport.js";

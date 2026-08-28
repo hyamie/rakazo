@@ -5,12 +5,12 @@ export type ResolveHostname = (hostname: string) => Promise<ResolvedAddress[]>;
 
 export function createAddressCheckedLookup(
   resolve: ResolveHostname,
-  validate: (addresses: ResolvedAddress[]) => void,
+  validate: (addresses: ResolvedAddress[], hostname: string) => void,
 ): LookupFunction {
   return (hostname, options, callback) => {
     void resolve(hostname)
       .then((addresses) => {
-        validate(addresses);
+        validate(addresses, hostname);
         if (options.all) {
           callback(null, addresses);
           return;

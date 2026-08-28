@@ -5,6 +5,7 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import type { ConnectorTool } from "@rakazo/adapter-kit";
 import { Agent } from "undici";
 import { combineSignals } from "./connector-safety.js";
+import { isLanAllowedHostname, isLanAllowedUrl } from "./mcp-lan-allowlist.js";
 import {
   createAddressCheckedLookup,
   isPrivateAddress,
@@ -123,10 +124,19 @@ export async function assertSafeRemoteUrl(
   } catch {
     throw new Error("Connector URL is invalid");
   }
-  if (url.protocol !== "https:") throw new Error("Connector URL must use HTTPS");
+  // A LAN host the operator listed is reachable over plain HTTP and at a private
+  // address. Both relaxations are scoped to that host: everything below this branch
+  // still applies to every other endpoint, and redirects are refused for all of them,
+  // so a listed host cannot forward a request onto an unlisted one.
+  const lanAllowed = isLanAllowedUrl(url);
+  if (!lanAllowed && url.protocol !== "https:") throw new Error("Connector URL must use HTTPS");
+  if (lanAllowed && url.protocol !== "https:" && url.protocol !== "http:") {
+    throw new Error("Connector URL must use HTTPS");
+  }
   if (url.username || url.password) throw new Error("Connector URL must not contain credentials");
   if (url.hash) throw new Error("Connector URL must not contain a fragment");
   const hostname = url.hostname.replace(/^\[|\]$/g, "");
+  if (lanAllowed) return url;
   if (isPrivateHostname(hostname)) throw new Error("Connector URL targets a private host");
   assertPublicAddresses(await resolve(hostname));
   return url;
@@ -158,7 +168,14 @@ export function createSafeRemoteFetch(
 }
 
 export function createSafeLookup(resolve: ResolveHostname = resolveHostname): LookupFunction {
-  return createAddressCheckedLookup(resolve, assertPublicAddresses);
+  // Hostname-aware so a listed LAN host keeps resolving to its private address. The
+  // check stays armed for every other name, which is what closes DNS rebinding: a
+  // public hostname that re-resolves to 10.x between validation and connect is still
+  // refused here, at the socket.
+  return createAddressCheckedLookup(resolve, (addresses, hostname) => {
+    if (isLanAllowedHostname(hostname)) return;
+    assertPublicAddresses(addresses);
+  });
 }
 
 function isPrivateHostname(hostname: string): boolean {

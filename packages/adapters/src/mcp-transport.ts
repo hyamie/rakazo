@@ -9,6 +9,7 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { CallToolResult, ListToolsResult } from "@modelcontextprotocol/sdk/types.js";
 import { combineSignals } from "./connector-safety.js";
+import { isLanAllowedUrl } from "./mcp-lan-allowlist.js";
 import {
   createSafeRemoteFetch,
   type RemoteTransportDependencies,
@@ -77,9 +78,13 @@ function validateUrl(raw: string | URL, policy: McpUrlPolicy = {}): URL {
     throw new Error("MCP URL must not contain credentials or a fragment");
   const local =
     url.hostname === "localhost" || url.hostname === "127.0.0.1" || url.hostname === "[::1]";
+  // A LAN host the deployment listed is the operator's own server on their own
+  // switch, so it is permitted over plain HTTP the same way localhost is. Every
+  // other host still has to be HTTPS.
   if (
     url.protocol !== "https:" &&
-    !(url.protocol === "http:" && policy.allowHttpLocalhost === true && local)
+    !(url.protocol === "http:" && policy.allowHttpLocalhost === true && local) &&
+    !(url.protocol === "http:" && isLanAllowedUrl(url))
   ) {
     throw new Error("MCP remote URL must use HTTPS (HTTP is allowed only for localhost)");
   }
