@@ -1,5 +1,6 @@
 import type { Models } from "@earendil-works/pi-ai";
 import { builtinModels } from "@earendil-works/pi-ai/providers/all";
+import { resolveDeploymentModel } from "./deployment-model.js";
 import { registerLocalProvider } from "./pi-local-provider.js";
 import {
   OPENAI_COMPATIBLE_PROVIDER_ID,
@@ -15,8 +16,6 @@ export const IMAGE_RETURNING_COMPUTER_TOOLS = new Set([
 ]);
 
 export const MODEL_CANNOT_SEE_MESSAGE = "This bot's model cannot see; pick a vision-capable model.";
-
-const SCRIPTED_DEFAULT_MODEL_ID = "deepseek/deepseek-v4-flash-0731";
 
 let catalogModelsCache: Models | undefined;
 
@@ -36,10 +35,11 @@ export function resolveModelRefForVisionCheck(
   const normalizedProvider = provider.trim();
   const normalizedId = modelId.trim();
   if (normalizedProvider === "scripted" || normalizedId === "scripted") {
-    return {
-      provider: "openrouter",
-      id: process.env.PI_DEFAULT_MODEL?.trim() || SCRIPTED_DEFAULT_MODEL_ID,
-    };
+    // resolveDeploymentModel is the one place the deployment default lives, so a
+    // self-host that pins PI_DEFAULT_PROVIDER gets its own provider here instead
+    // of a hardcoded OpenRouter its allowlist then refuses.
+    const deployment = resolveDeploymentModel();
+    return { provider: deployment.provider, id: deployment.model };
   }
   return { provider: normalizedProvider, id: normalizedId };
 }

@@ -42,6 +42,17 @@ describe("model vision gating for computer tools", () => {
     expect(modelAcceptsImageInput("scripted", "scripted")).toBe(true);
   });
 
+  it("resolves the scripted placeholder against PI_DEFAULT_PROVIDER, not a hardcoded vendor", () => {
+    // A deployment that pins its own provider must not have `scripted` silently
+    // rewritten to OpenRouter: the allowlist then refuses the run it produced.
+    vi.stubEnv("PI_DEFAULT_PROVIDER", "local");
+    vi.stubEnv("PI_DEFAULT_MODEL", "gx10-fast");
+    expect(resolveModelRefForVisionCheck("scripted", "scripted")).toEqual({
+      provider: "local",
+      id: "gx10-fast",
+    });
+  });
+
   it("treats unknown models as text-only", () => {
     expect(modelAcceptsImageInput("openrouter", "rakazo-test/unknown-future-model")).toBe(false);
   });

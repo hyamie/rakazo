@@ -18,6 +18,7 @@ import type {
   ConnectorTool,
 } from "@rakazo/adapter-kit";
 import { builtinAgentTools, DELEGATION_TOOL_NAMES } from "./builtin-tools.js";
+import { resolveDeploymentModel } from "./deployment-model.js";
 import { PiRuntimeCredentialStore, toOAuthCredential } from "./pi-credentials.js";
 import { registerLocalProvider } from "./pi-local-provider.js";
 import {
@@ -89,14 +90,15 @@ export class PiAgentRuntime implements AgentRuntime {
 
     const work = (async () => {
       try {
+        // The `scripted` placeholder means "whatever this deployment defaults to".
+        // resolveDeploymentModel owns that answer; hardcoding OpenRouter here sent
+        // every override-less bot to a provider the allowlist then refused.
+        const deployment = resolveDeploymentModel();
         const provider =
-          request.model.provider === "scripted" ? "openrouter" : request.model.provider;
+          request.model.provider === "scripted" ? deployment.provider : request.model.provider;
         const envDefaultModel = process.env.PI_DEFAULT_MODEL?.trim();
-        const envDefaultProvider = process.env.PI_DEFAULT_PROVIDER?.trim() || "openrouter";
         const modelId =
-          request.model.id === "scripted"
-            ? envDefaultModel || "deepseek/deepseek-v4-flash-0731"
-            : request.model.id.trim();
+          request.model.id === "scripted" ? deployment.model : request.model.id.trim();
         // The catalog filter hides a disallowed provider from the picker; this
         // refuses it on the execution path. A stored model connection made
         // before the allowlist was tightened would otherwise keep running.
@@ -116,7 +118,7 @@ export class PiAgentRuntime implements AgentRuntime {
         if (
           !model &&
           provider === "openrouter" &&
-          envDefaultProvider === "openrouter" &&
+          deployment.provider === "openrouter" &&
           modelId === envDefaultModel
         ) {
           model = configuredOpenRouterModel(modelId);
