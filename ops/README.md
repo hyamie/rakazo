@@ -254,8 +254,16 @@ push. Neither shows what is on disk right now, which is the thing worth seeing.
 | `/mnt/work` | `/var/rakazo/botwork` on the VM, **writable** scratch |
 
 Wired by `RAKAZO_COMPUTER_EXTRA_MOUNTS` on the supervisor, which passes them to
-every bot computer it creates. The bot's existing `shell`, `read_file` and
-`list_files` tools see both; no new tools were needed.
+every bot computer it creates. No new Rakazo tools were needed: the bot's
+existing `shell`, `read_file` and `list_files` reach both.
+
+The **image** did need work, found by running it rather than reasoning about it.
+`git` was simply absent (`git: not found` inside a real bot computer), so the
+clone workflow could not run at all, and `ripgrep` is what makes searching ~60
+repos a different activity from reading files one at a time. Both are in the
+image now, along with git's dubious-ownership check waived system-wide: the agent
+runs as root while the mounted tree arrives owned by uid 1000, and without the
+waiver every git command against it fails in a way that looks like a broken mount.
 
 ### Why read-only plus a scratch, and not worktrees
 
