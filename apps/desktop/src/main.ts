@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
 import { readFile, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
@@ -8,6 +9,13 @@ import {
   type ElectronAutoUpdater,
   LAUNCH_CHECK_DELAY_MS,
 } from "./auto-update.js";
+import { DOCKER_INSTALL_LINKS, isDesktopSetupLink, runDocker } from "./docker-cli.js";
+import {
+  LocalStackController,
+  resolveImageTag,
+  stackDir,
+  stackResourceDir,
+} from "./local-stack.js";
 import { oauthCallbackFrom } from "./oauth-callback.js";
 import {
   bundledRendererCandidates,
@@ -18,7 +26,10 @@ import {
 } from "./renderer-assets.js";
 import {
   DEFAULT_LOCAL_WEB_URL,
+  desktopStackImageTag,
   isRakazoHealth,
+  managedLocalOpenUrl,
+  maySendDesktopStackToken,
   normalizeServerUrl,
   parseSetupInput,
   probeFailureMessage,
@@ -28,11 +39,21 @@ import {
   sessionPartitionForServerUrl,
 } from "./setup-config.js";
 import { clearSetup, readSetup, writeSetup } from "./setup-store.js";
-import { browserWindowOptions, setupWindowOptions, warmWindowTtlMs } from "./window-options.js";
+import { shouldOpenInAppPopup } from "./window-open.js";
+import {
+  browserWindowOptions,
+  developmentIconFile,
+  setupWindowOptions,
+  warmWindowTtlMs,
+} from "./window-options.js";
 
 const PERFORMANCE_USER_DATA = process.env.RAKAZO_PERFORMANCE_USER_DATA;
+/** Test hook: where the app-managed stack answers. Mode `new` still requires loopback. */
+const LOCAL_WEB_URL = process.env.RAKAZO_LOCAL_WEB_URL?.trim() || DEFAULT_LOCAL_WEB_URL;
 const PROBE_TIMEOUT_MS = 8_000;
 const PROBE_RESPONSE_LIMIT_BYTES = 64 * 1024;
+const DESKTOP_STACK_PROBE_PATH = "/.well-known/rakazo-desktop-stack";
+const DESKTOP_STACK_TOKEN_HEADER = "x-rakazo-desktop-stack-token";
 let mainWindow: BrowserWindow | null = null;
 let setupWindow: BrowserWindow | null = null;
 const bundledRendererInstallations = new Set<string>();
@@ -57,6 +78,7 @@ const desktopUpdater = new DesktopUpdateController(updaterEnvironment, async () 
   return (module.default ?? module).autoUpdater as unknown as ElectronAutoUpdater;
 });
 let launchUpdateCheckScheduled = false;
+let localStack: LocalStackController;
 
 markOnce("rk:main:module-evaluated");
 if (PERFORMANCE_USER_DATA) {
@@ -78,9 +100,10 @@ function fromMainWindow(event: Electron.IpcMainInvokeEvent) {
   return mainWindow !== null && windowFrom(event) === mainWindow;
 }
 
+/** Dock/taskbar icon for unpackaged launches; packaged builds get theirs from electron-builder. */
 function developmentIcon() {
   if (app.isPackaged) return undefined;
-  const icon = path.join(app.getAppPath(), "assets", "icon.png");
+  const icon = path.join(app.getAppPath(), "assets", developmentIconFile(process.platform));
   return existsSync(icon) ? icon : undefined;
 }
 
@@ -195,24 +218,13 @@ function createWindow(url: string, partition: string | null) {
   });
   mainWindow = win;
   const targetOrigin = safeOrigin(url);
-  // OAuth flows open the provider's authorize page via window.open; give that
-  // popup a normal framed window. Non-http(s) targets stay closed; other http(s)
-  // origins open in the system browser so a connected server cannot navigate us away.
+  // Intentional OAuth flows open the provider's authorize page via a named
+  // window; give those and same-origin popups a normal frame. Everything else
+  // opens in the system browser so a connected server cannot navigate us away.
   // Hoisted for loopback OAuth capture so MCP/in-app localhost callbacks are skipped.
   const appOrigin = targetOrigin ?? safeOrigin(url);
-  win.webContents.setWindowOpenHandler(({ url: childUrl }) => {
-    let target: URL;
-    try {
-      target = new URL(childUrl);
-    } catch {
-      return { action: "deny" };
-    }
-    const sameOrigin = appOrigin !== null && target.origin === appOrigin;
-    // Same-origin http(s) and third-party https (OAuth) get a framed popup.
-    if (
-      (sameOrigin && (target.protocol === "http:" || target.protocol === "https:")) ||
-      (!sameOrigin && target.protocol === "https:")
-    ) {
+  win.webContents.setWindowOpenHandler(({ url: childUrl, frameName }) => {
+    if (shouldOpenInAppPopup(appOrigin, childUrl, frameName)) {
       return {
         action: "allow",
         overrideBrowserWindowOptions: oauthPopupWindowOptions(),
@@ -225,6 +237,8 @@ function createWindow(url: string, partition: string | null) {
   win.webContents.on("will-navigate", (event, navigationUrl) => {
     if (targetOrigin !== null && safeOrigin(navigationUrl) === targetOrigin) return;
     event.preventDefault();
+    const external = safeExternalUrl(navigationUrl);
+    if (external !== null) void shell.openExternal(external);
   });
   // The popup has no address bar, so a loopback redirect would otherwise strand
   // the user on a blank window holding the authorization code in a URL they
@@ -432,7 +446,7 @@ async function waitForMountedAppDocument(contents: Electron.WebContents) {
       // Desktop e2e fixtures mount a plain page without Rakazo app-state markers.
       if (appState === null) {
         const bodyText = (document.body?.innerText || "").trim();
-        if (bodyText.includes("Opening your workspace")) return false;
+        if (bodyText.includes("Opening your Space")) return false;
         if (bodyText === "Loading…" || bodyText === "Loading...") return false;
         const mainText = (document.querySelector("main")?.textContent || "").trim();
         const rootChildren = document.getElementById("root")?.childElementCount ?? 0;
@@ -502,7 +516,7 @@ function oauthPopupWindowOptions() {
     frame: true,
     titleBarStyle: "default" as const,
     autoHideMenuBar: true,
-    backgroundColor: "#050506",
+    backgroundColor: "#0D0D0E",
     webPreferences: {
       preload: "",
       nodeIntegration: false,
@@ -569,6 +583,14 @@ function installApplicationMenu() {
     accelerator: "CmdOrCtrl+Shift+K",
     click: () => showSetupWindow(),
   };
+  const stopStack: Electron.MenuItemConstructorOptions = {
+    id: "stop-local-stack",
+    label: "Stop Local Stack",
+    // The stack keeps running after quit (bots are always on); this is the explicit off switch.
+    click: () => {
+      if (currentSetup?.mode === "new") void localStack.stop();
+    },
+  };
   const template: Electron.MenuItemConstructorOptions[] =
     process.platform === "darwin"
       ? [
@@ -578,6 +600,7 @@ function installApplicationMenu() {
               { role: "about" },
               { type: "separator" },
               changeServer,
+              stopStack,
               { type: "separator" },
               { role: "hide" },
               { role: "hideOthers" },
@@ -592,7 +615,7 @@ function installApplicationMenu() {
       : [
           {
             label: "File",
-            submenu: [changeServer, { type: "separator" }, { role: "quit" }],
+            submenu: [changeServer, stopStack, { type: "separator" }, { role: "quit" }],
           },
           { role: "editMenu" },
           { role: "windowMenu" },
@@ -607,9 +630,10 @@ function fromSetupWindow(event: Electron.IpcMainInvokeEvent) {
   );
 }
 
-async function probeServer(rawUrl: string): Promise<DesktopReachability> {
+async function probeServer(rawUrl: string, signal?: AbortSignal): Promise<DesktopReachability> {
   const url = normalizeServerUrl(rawUrl);
   if (url === null) return { ok: false, error: "Enter a valid http:// or https:// address." };
+  const timeout = AbortSignal.timeout(PROBE_TIMEOUT_MS);
 
   try {
     const response = await net.fetch(`${url}/rpc/health`, {
@@ -619,7 +643,7 @@ async function probeServer(rawUrl: string): Promise<DesktopReachability> {
       cache: "no-store",
       credentials: "omit",
       redirect: "manual",
-      signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
+      signal: signal ? AbortSignal.any([timeout, signal]) : timeout,
     });
     if (response.status >= 300 && response.status < 400) {
       return {
@@ -653,6 +677,32 @@ async function probeServer(rawUrl: string): Promise<DesktopReachability> {
     };
   } catch (error) {
     return { ok: false, url, error: probeFailureMessage(error) };
+  }
+}
+
+/** A public health response is not enough: another checkout may own the same fixed port. */
+async function probeManagedStack(
+  rawUrl: string,
+  token: string,
+  signal?: AbortSignal,
+): Promise<string | null> {
+  const url = normalizeServerUrl(rawUrl);
+  // Never put the private stack token on a cleartext LAN or .local hop.
+  if (url === null || !maySendDesktopStackToken(url)) return null;
+  const timeout = AbortSignal.timeout(PROBE_TIMEOUT_MS);
+  try {
+    const response = await net.fetch(`${url}${DESKTOP_STACK_PROBE_PATH}`, {
+      method: "GET",
+      headers: { [DESKTOP_STACK_TOKEN_HEADER]: token },
+      cache: "no-store",
+      credentials: "omit",
+      redirect: "manual",
+      signal: signal ? AbortSignal.any([timeout, signal]) : timeout,
+    });
+    if (!response.ok) return null;
+    return desktopStackImageTag(await limitedJson(response));
+  } catch {
+    return null;
   }
 }
 
@@ -839,6 +889,26 @@ function safeOrigin(targetUrl: string) {
 
 app.whenReady().then(async () => {
   const userDataDir = app.getPath("userData");
+  localStack = new LocalStackController({
+    platform: process.platform,
+    env: process.env,
+    exists: existsSync,
+    run: runDocker,
+    stackDir: stackDir(userDataDir),
+    resourceDir: stackResourceDir({
+      packaged: app.isPackaged,
+      resourcesPath: process.resourcesPath,
+      appPath: app.getAppPath(),
+    }),
+    localWebUrl: LOCAL_WEB_URL,
+    imageTag: resolveImageTag({
+      version: app.getVersion(),
+      packaged: app.isPackaged,
+      override: process.env.RAKAZO_IMAGE_TAG,
+    }),
+    probe: (url, signal, token) => probeManagedStack(url, token, signal),
+    randomHex: (bytes) => randomBytes(bytes).toString("hex"),
+  });
   currentSetup = await readSetup(userDataDir);
   const target = resolveStartupTarget({
     envUrl: process.env.RAKAZO_WEB_URL,
@@ -905,7 +975,7 @@ app.whenReady().then(async () => {
   ipcMain.handle("desktop.setup.state", (event) => {
     if (!fromSetupWindow(event)) return null;
     return {
-      defaultLocalUrl: DEFAULT_LOCAL_WEB_URL,
+      defaultLocalUrl: LOCAL_WEB_URL,
       saved: currentSetup,
       error: setupError ?? undefined,
     };
@@ -934,12 +1004,25 @@ app.whenReady().then(async () => {
         };
       }
 
-      const reachability = await probeServer(setup.serverUrl);
+      // Managed stacks authenticate LOCAL_WEB_URL only; never open a different loopback.
+      let openSetup = setup;
+      if (setup.mode === "new") {
+        const managedUrl = managedLocalOpenUrl(setup.serverUrl, LOCAL_WEB_URL);
+        if (managedUrl === null || !(await localStack.matchesDesiredStack())) {
+          return {
+            ok: false,
+            error: "The app-managed Rakazo services are not ready. Retry setup.",
+          };
+        }
+        openSetup = { mode: "new", serverUrl: managedUrl };
+      }
+
+      const reachability = await probeServer(openSetup.serverUrl);
       if (!reachability.ok) return { ok: false, error: reachability.error };
 
       // Open before persisting so a failed renderer load keeps the last working setup.
-      currentSetup = setup;
-      const opened = await openApp(setup.serverUrl);
+      currentSetup = openSetup;
+      const opened = await openApp(openSetup.serverUrl);
       if (!opened) {
         currentSetup = previousSetup;
         return {
@@ -954,7 +1037,7 @@ app.whenReady().then(async () => {
           ? watchRendererUntilCommitted(appWindow)
           : null;
       try {
-        await writeSetup(userDataDir, setup);
+        await writeSetup(userDataDir, openSetup);
         if (rendererWatch?.crashed()) {
           const message = await recoverFromCrashedSave(userDataDir, previousSetup, previousUrl);
           return { ok: false, error: message };
@@ -992,6 +1075,19 @@ app.whenReady().then(async () => {
   ipcMain.handle("desktop.setup.quit", (event) => {
     if (fromSetupWindow(event)) app.quit();
   });
+  ipcMain.handle("desktop.setup.openLink", async (event, link: unknown) => {
+    if (!fromSetupWindow(event) || !isDesktopSetupLink(link)) return;
+    await shell.openExternal(DOCKER_INSTALL_LINKS[link]);
+  });
+  ipcMain.handle("desktop.setup.stack.state", (event) =>
+    fromSetupWindow(event) ? localStack.state() : null,
+  );
+  ipcMain.handle("desktop.setup.stack.start", (event) => {
+    if (!fromSetupWindow(event)) return null;
+    // Respond right away; the setup window polls `stack.state` until a terminal phase.
+    void localStack.start();
+    return localStack.state();
+  });
 
   // Register before startup awaits so macOS dock clicks during probe/open are handled.
   app.on("activate", () => {
@@ -1017,14 +1113,31 @@ app.whenReady().then(async () => {
   if (target.kind === "setup") {
     showSetupWindow();
   } else if (target.source === "saved") {
-    const reachability = await probeServer(target.url);
-    if (reachability.ok) {
-      if (await openApp(target.url)) {
-        commitPendingAppSwitch();
-        destroySetupWindow();
+    if (currentSetup?.mode === "new") {
+      const managedUrl = managedLocalOpenUrl(target.url, LOCAL_WEB_URL);
+      const managedStackReady =
+        managedUrl !== null ? await localStack.matchesDesiredStack() : false;
+      if (managedStackReady && managedUrl !== null) {
+        if (await openApp(managedUrl)) {
+          commitPendingAppSwitch();
+          destroySetupWindow();
+        }
+      } else {
+        // Missing, stale, foreign, or owned by another process: reconcile the
+        // app-managed stack before any API or computer traffic is allowed.
+        void localStack.start();
+        showSetupWindow();
       }
     } else {
-      showSetupWindow(`Could not reconnect to the saved server. ${reachability.error}`);
+      const reachability = await probeServer(target.url);
+      if (reachability.ok) {
+        if (await openApp(target.url)) {
+          commitPendingAppSwitch();
+          destroySetupWindow();
+        }
+      } else {
+        showSetupWindow(`Could not reconnect to the saved server. ${reachability.error}`);
+      }
     }
   } else {
     if (await openApp(target.url)) {
@@ -1041,4 +1154,6 @@ app.on("window-all-closed", () => {
 app.on("before-quit", () => {
   quitting = true;
   clearTimeout(warmWindowTimer);
+  // Containers keep running; only an in-flight pull/up is cut short.
+  localStack?.abort();
 });

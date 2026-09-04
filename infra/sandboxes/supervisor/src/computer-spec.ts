@@ -1,8 +1,24 @@
 import { createHash } from "node:crypto";
 
 export const COMPUTER_IMAGE = process.env.RAKAZO_COMPUTER_IMAGE ?? "rakazo/computer:local";
+export const COMPUTER_UID = 1000;
+export const COMPUTER_GID = 1000;
+export const COMPUTER_USER = `${COMPUTER_UID}:${COMPUTER_GID}`;
 export const TEAM_SCREEN_LIMIT = 8;
+export const COMPUTER_CONTROL_PORT = 7070;
 export const SCREEN_HOST = process.env.SANDBOX_SCREEN_HOST ?? "127.0.0.1";
+export type ScreenNetworkMode = "published" | "internal" | "isolated";
+
+export function resolveScreenNetworkMode(value: string | undefined): ScreenNetworkMode {
+  if (!value || value === "published") return "published";
+  if (value === "internal" || value === "isolated") return value;
+  throw new Error(`Unsupported SANDBOX_SCREEN_NETWORK value: ${value}`);
+}
+
+export function hostComputerUser(uid = process.getuid?.(), gid = process.getgid?.()): string {
+  if (uid === undefined || gid === undefined || uid === 0) return COMPUTER_USER;
+  return `${uid}:${gid}`;
+}
 
 /**
  * Host address the computer's screen ports are published on.
@@ -40,6 +56,8 @@ export const COMPUTER_BIND_HOST = process.env.RAKAZO_COMPUTER_BIND_HOST ?? "127.
 const DEFAULT_COMPUTER_MEMORY = "2g";
 const DEFAULT_COMPUTER_CPUS = "2";
 const DEFAULT_COMPUTER_PIDS_LIMIT = "512";
+/** The daemon refuses HostConfig.Memory below this at container creation. */
+const MIN_DOCKER_MEMORY_BYTES = 6 * 1024 ** 2;
 
 const MEMORY_UNITS: Record<string, number> = {
   b: 1,
@@ -65,6 +83,11 @@ export function parseMemoryBytes(name: string, raw: string): number {
   if (!Number.isSafeInteger(bytes) || bytes <= 0) {
     throw new Error(`${name} must resolve to a positive byte count, received "${raw}"`);
   }
+  // The daemon rejects a limit under 6 MiB at container creation, so catching it
+  // here turns a per-bot 500 into a startup failure that names the variable.
+  if (bytes < MIN_DOCKER_MEMORY_BYTES) {
+    throw new Error(`${name} must be at least 6m, Docker's minimum, received "${raw}"`);
+  }
   return bytes;
 }
 
@@ -72,10 +95,14 @@ export function parseMemoryBytes(name: string, raw: string): number {
 export function parseNanoCpus(name: string, raw: string): number {
   if (isUnlimited(raw)) return 0;
   const value = Number(raw.trim());
-  if (!Number.isFinite(value) || value <= 0) {
+  // A positive value below 1e-9 floors to 0 nanocpus, which Docker reads as
+  // *unlimited*. Check the converted number, not just the input, so an accepted
+  // limit can never silently become no limit.
+  const nanoCpus = Math.floor(value * 1e9);
+  if (!Number.isFinite(value) || value <= 0 || nanoCpus <= 0) {
     throw new Error(`${name} must be a positive number of CPUs, received "${raw}"`);
   }
-  return Math.floor(value * 1e9);
+  return nanoCpus;
 }
 
 function parsePidsLimit(name: string, raw: string): number {
@@ -190,6 +217,8 @@ export function computerPortBindings() {
     PortBindings[`${ports.viewPort}/tcp`] = [{ HostIp: COMPUTER_BIND_HOST, HostPort: "0" }];
     PortBindings[`${ports.controlPort}/tcp`] = [{ HostIp: COMPUTER_BIND_HOST, HostPort: "0" }];
   }
+  // Control stays on the container network only (0.0.0.0 inside the container).
+  // Do not publish 7070 to the host.
   return { ExposedPorts, PortBindings };
 }
 
@@ -197,8 +226,10 @@ export interface ComputerCreateInput {
   name: string;
   image: string;
   botId: string;
-  workspaceId: string;
+  spaceId: string;
   homePath: string;
+  user?: string;
+  controlToken?: string;
   networkMode?: string;
 }
 
@@ -220,6 +251,7 @@ export function containerCreateOptions(input: ComputerCreateInput) {
   return {
     Image: input.image,
     name: input.name,
+    User: input.user ?? COMPUTER_USER,
     Tty: true,
     Env: [
       "DISPLAY=:1",
@@ -227,11 +259,12 @@ export function containerCreateOptions(input: ComputerCreateInput) {
       "PATH=/home/rakazo/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
       "NPM_CONFIG_PREFIX=/home/rakazo/.local",
       "PIP_USER=1",
+      ...(input.controlToken ? [`RAKAZO_COMPUTER_CONTROL_TOKEN=${input.controlToken}`] : []),
     ],
     Labels: {
       "rakazo.managed": "true",
       "rakazo.botId": input.botId,
-      "rakazo.workspaceId": input.workspaceId,
+      "rakazo.spaceId": input.spaceId,
     },
     ExposedPorts: ports.ExposedPorts,
     HostConfig: {
@@ -241,6 +274,10 @@ export function containerCreateOptions(input: ComputerCreateInput) {
       ],
       PortBindings: ports.PortBindings,
       ShmSize: 256 * 1024 * 1024,
+      CapDrop: ["ALL"],
+      SecurityOpt: ["no-new-privileges:true"],
+      // After #343's hardening, so this deployment's configured ceilings win over
+      // the literal PidsLimit it sets. Memory and NanoCpus are ours alone.
       ...computerResourceLimits(),
       ReadonlyPaths: ["/usr/share/novnc"],
       AutoRemove: false,
@@ -278,6 +315,17 @@ export function computerNetworkNamesForCleanup(botId: string) {
   ];
 }
 
+/**
+ * Legacy unsalted network names can collide across botIds. Only remove such a
+ * network when no other bot's container is still attached.
+ */
+export function legacyNetworkOwnedSolelyBy(
+  botId: string,
+  attachedBotIds: Array<string | undefined>,
+): boolean {
+  return attachedBotIds.every((owner) => owner === botId);
+}
+
 export function screenUrlFor(hostPort: string, host = SCREEN_HOST) {
   return `http://${host}:${hostPort}/embed.html`;
 }
@@ -287,24 +335,43 @@ export function screenUrlFor(hostPort: string, host = SCREEN_HOST) {
  *
  * Per-bot NetworkMode isolation must not change this: a container always has a
  * docker-internal IP on its network, but browsers cannot load that 172.x
- * address. Only the internal compose topology may return the container IP;
- * the default topology must keep using the published host mapping.
+ * address. Compose modes that attach the supervisor/screen proxy to the bot
+ * network may return the container IP; host-run supervisors use the published
+ * loopback mapping.
  */
 export function resolveScreenPublishTarget(input: {
-  screenNetwork: string | undefined;
+  screenNetwork: ScreenNetworkMode;
   networkMode: string | null | undefined;
   networks: Record<string, { IPAddress?: string } | undefined> | null | undefined;
   hostPort: string | undefined;
   containerPort: string;
   screenHost?: string;
 }): { host: string; port: string } | undefined {
-  if (input.screenNetwork === "internal") {
+  if (input.screenNetwork === "internal" || input.screenNetwork === "isolated") {
     const address = input.networkMode ? input.networks?.[input.networkMode]?.IPAddress : undefined;
     if (address) return { host: address, port: input.containerPort };
     return undefined;
   }
   if (input.hostPort) return { host: input.screenHost ?? SCREEN_HOST, port: input.hostPort };
   return undefined;
+}
+
+/**
+ * Resolve the in-container control service via its Docker network IP.
+ * Control is never host-published; the supervisor reaches 7070 on the
+ * container network while the process binds 0.0.0.0 inside the sandbox.
+ */
+export function resolveComputerControlEndpoint(input: {
+  token: string | undefined;
+  networkMode: string | null | undefined;
+  networks: Record<string, { IPAddress?: string } | undefined> | null | undefined;
+}): { url: string; token: string } | undefined {
+  if (!input.token) return undefined;
+  const address =
+    (input.networkMode ? input.networks?.[input.networkMode]?.IPAddress : undefined) ||
+    Object.values(input.networks ?? {}).find((network) => network?.IPAddress)?.IPAddress;
+  if (!address) return undefined;
+  return { url: `http://${address}:${COMPUTER_CONTROL_PORT}/v1/desktop`, token: input.token };
 }
 
 export function xdotoolCommand(input: SandboxInput): string[] {

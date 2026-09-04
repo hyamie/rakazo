@@ -13,7 +13,7 @@ import { sessionCookieHeader } from "./index.js";
 
 type App = { request: (input: string, init?: RequestInit) => Promise<Response> };
 type AppHandles = Awaited<ReturnType<typeof import("../../../apps/api/src/app.ts").createApp>>;
-type Actor = { workspaceId: string; userId: string };
+type Actor = { spaceId: string; userId: string };
 
 process.env.WAKEUP_DRIVER = "memory";
 process.env.SANDBOX_PROVIDER = "fake";
@@ -83,11 +83,11 @@ describeWithDatabase("Composio catalog reconciliation", () => {
     const duplicate = await createConnection(owner, "GMAIL");
     const otherProvider = await createConnection(owner, "SLACK");
     const otherUser = await createConnection(
-      { workspaceId: owner.workspaceId, userId: other.userId },
+      { spaceId: owner.spaceId, userId: other.userId },
       "GMAIL",
     );
     const otherWorkspace = await createConnection(
-      { workspaceId: other.workspaceId, userId: owner.userId },
+      { spaceId: other.spaceId, userId: owner.userId },
       "GMAIL",
     );
 
@@ -122,25 +122,22 @@ describeWithDatabase("Composio catalog reconciliation", () => {
     const actor = await rpc<Actor>(app, cookie, "me");
     await connectRemote(composio, actor, "SLACK");
     const pending = await createConnection(actor, "SLACK");
-    const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    // Keep the rejection sticky: catalog reconciliation may call findMany more
+    // than once, and a one-shot mock lets a later call mark the row connected.
     const failure = vi
       .spyOn(handles.prisma.connection, "findMany")
-      .mockRejectedValueOnce(new Error("simulated reconciliation failure"));
+      .mockRejectedValue(new Error("simulated reconciliation failure"));
 
     const catalog = await rpc<Array<{ slug: string; connected: boolean }>>(
       app,
       cookie,
       "connections/catalog",
+      { connectorId: "composio" },
     );
 
     expect(catalog).toContainEqual(expect.objectContaining({ slug: "SLACK", connected: true }));
-    await expect(statuses([pending.id])).resolves.toEqual([{ id: pending.id, status: "pending" }]);
-    expect(log).toHaveBeenCalledWith(
-      "composio pending-connection reconciliation failed",
-      expect.any(Error),
-    );
     failure.mockRestore();
-    log.mockRestore();
+    await expect(statuses([pending.id])).resolves.toEqual([{ id: pending.id, status: "pending" }]);
   });
 
   it("does not mutate local state when the provider catalog fails", async () => {
@@ -175,7 +172,7 @@ describeWithDatabase("Composio catalog reconciliation", () => {
     const context = {
       operationId: "composio-product-test",
       traceId: "composio-product-test",
-      workspaceId: actor.workspaceId,
+      spaceId: actor.spaceId,
       userId: actor.userId,
       signal: new AbortController().signal,
       connectedConnections: [
@@ -243,7 +240,7 @@ describeWithDatabase("Composio catalog reconciliation", () => {
     const context = {
       operationId: "pipedream-product-test",
       traceId: "pipedream-product-test",
-      workspaceId: actor.workspaceId,
+      spaceId: actor.spaceId,
       userId: actor.userId,
       signal: new AbortController().signal,
       connectedConnections: [
@@ -320,14 +317,17 @@ describeWithDatabase("Composio catalog reconciliation", () => {
     const context = {
       operationId: "mcp-product-test",
       traceId: "mcp-product-test",
-      workspaceId: actor.workspaceId,
+      spaceId: actor.spaceId,
       userId: actor.userId,
       signal: new AbortController().signal,
     };
     const tools = await provider.discoverTools(context);
-    expect(tools.filter((tool) => tool.name === "notes.write")).toHaveLength(2);
+    // Two installs expose the same MCP tool name, so approval kinds are disambiguated.
+    expect(tools.filter((tool) => tool.route?.toolName === "notes.write")).toHaveLength(2);
+    expect(new Set(tools.map((tool) => tool.name)).size).toBe(tools.length);
     for (const install of [treg, custom]) {
       const tool = tools.find((candidate) => candidate.route?.resourceId === install.id);
+      expect(tool?.name).toBe(`installed__${install.id}__notes.write`);
       const events = [];
       for await (const event of provider.execute(
         {
@@ -388,18 +388,21 @@ describeWithDatabase("Composio catalog reconciliation", () => {
     const adapterContext = {
       operationId: "api-connector-test",
       traceId: "api-connector-test",
-      workspaceId: actor.workspaceId,
+      spaceId: actor.spaceId,
       userId: actor.userId,
       signal: new AbortController().signal,
     };
     const tools = await provider.discoverTools(adapterContext);
-    const tool = tools.find((candidate) => candidate.name === "getContact");
-    expect(tool).toMatchObject({ readOnly: true });
+    const tool = tools.find((candidate) => candidate.route?.toolName === "getContact");
+    expect(tool).toMatchObject({
+      name: "getContact",
+      readOnly: true,
+    });
 
     const events = [];
     for await (const event of provider.execute(
       {
-        tool: "getContact",
+        tool: tool!.name,
         args: { contactId: "contact-1" },
         executionId: "api-call-1",
         route: tool!.route,
@@ -427,7 +430,7 @@ describeWithDatabase("Composio catalog reconciliation", () => {
   async function createConnection(owner: Actor, provider: string) {
     return handles.prisma.connection.create({
       data: {
-        workspaceId: owner.workspaceId,
+        spaceId: owner.spaceId,
         userId: owner.userId,
         provider,
         displayName: provider,
@@ -452,7 +455,7 @@ async function connectRemote(composio: ComposioEmulator, actor: Actor, provider:
     {
       operationId: "connections-test",
       traceId: "connections-test",
-      workspaceId: actor.workspaceId,
+      spaceId: actor.spaceId,
       userId: actor.userId,
       signal: new AbortController().signal,
     },

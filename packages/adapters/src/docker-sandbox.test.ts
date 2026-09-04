@@ -5,7 +5,7 @@ import { DockerSandboxProvider } from "./docker-sandbox.js";
 const context = {
   operationId: "docker-test",
   traceId: "docker-test",
-  workspaceId: "workspace",
+  spaceId: "workspace",
   userId: "user",
   botId: "bot",
   screenLeaseId: "run-1:1",
@@ -46,6 +46,10 @@ describe("Docker sandbox", () => {
       { type: "exit", code: 124 },
     ]);
     expect(fetchMock.mock.calls[0]?.[1]?.headers).not.toHaveProperty("x-rakazo-screen-id");
+    expect(fetchMock.mock.calls[0]?.[1]?.headers).toMatchObject({
+      "x-request-id": expect.any(String),
+      traceparent: expect.stringMatching(/^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$/),
+    });
   });
 
   it("releases this bot's screen assignment through the supervisor", async () => {
@@ -66,7 +70,7 @@ describe("Docker sandbox", () => {
           authorization: "Bearer test-token",
           "x-rakazo-bot-id": "home-bot",
           "x-rakazo-screen-lease-id": "run-1:1",
-          "x-rakazo-workspace-id": "workspace",
+          "x-rakazo-space-id": "workspace",
         }),
       }),
     );
@@ -91,5 +95,64 @@ describe("Docker sandbox", () => {
 
     expect(fetchMock).toHaveBeenCalledOnce();
     expect(fetchMock.mock.calls[0]?.[1]).not.toHaveProperty("signal");
+  });
+
+  it("surfaces a supervisor failure from stop and destroy instead of swallowing it", async () => {
+    const fetchMock = vi.fn(async () => Response.json({ error: "unauthorized" }, { status: 401 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const provider = new DockerSandboxProvider("http://supervisor.test", "stale-token");
+    const computer = {
+      id: "computer",
+      botId: "bot",
+      kind: "docker",
+      providerRef: "computer",
+    } as const;
+
+    await expect(provider.stop(computer, context)).rejects.toThrow(
+      'sandbox stop failed: 401 {"error":"unauthorized"}',
+    );
+    await expect(provider.destroy(computer, context)).rejects.toThrow(
+      'sandbox destroy failed: 401 {"error":"unauthorized"}',
+    );
+
+    fetchMock.mockImplementation(async () => new Response("boom", { status: 500 }));
+    await expect(provider.stop(computer, context)).rejects.toThrow("sandbox stop failed: 500 boom");
+    await expect(provider.destroy(computer, context)).rejects.toThrow(
+      "sandbox destroy failed: 500 boom",
+    );
+  });
+
+  it("treats a computer the supervisor no longer knows as already stopped and destroyed", async () => {
+    const fetchMock = vi.fn(async () =>
+      Response.json({ error: "computer not found" }, { status: 404 }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const provider = new DockerSandboxProvider("http://supervisor.test", "test-token");
+    const computer = {
+      id: "computer",
+      botId: "bot",
+      kind: "docker",
+      providerRef: "computer",
+    } as const;
+
+    await expect(provider.stop(computer, context)).resolves.toBeUndefined();
+    await expect(provider.destroy(computer, context)).resolves.toBeUndefined();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+  it("asks the supervisor to cancel orphaned run work when releasing a screen", async () => {
+    const fetchMock = vi.fn(async () => Response.json({ ok: true }));
+    vi.stubGlobal("fetch", fetchMock);
+    const provider = new DockerSandboxProvider("http://supervisor.test", "test-token");
+    await provider.releaseScreen(
+      { id: "computer-1", botId: "bot", kind: "docker", providerRef: "computer-1" },
+      { ...context, cancelRunWork: true },
+    );
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://supervisor.test/computers/computer-1/screen",
+      expect.objectContaining({
+        method: "DELETE",
+        headers: expect.objectContaining({ "x-rakazo-cancel-run-work": "1" }),
+      }),
+    );
   });
 });

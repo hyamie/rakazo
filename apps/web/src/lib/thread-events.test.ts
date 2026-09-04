@@ -7,9 +7,11 @@ import type {
 import { describe, expect, it } from "vitest";
 import {
   activeThreadRuns,
+  applyThreadSendReceipt,
   clearActiveThreadRuns,
   computerPanelAutoBoot,
   computerPanelAutoUsesBoot,
+  computerPanelNeedsMaintenance,
   computerTakeoverBlocked,
   isThreadSnapshotEvent,
   mergeThreadSnapshot,
@@ -17,10 +19,63 @@ import {
   reconcileRefreshedThread,
   reduceComputerStatus,
   reduceThreadSnapshot,
+  threadRunError,
   userHoldsComputerControl,
 } from "./thread-events.js";
 
 describe("thread event reduction", () => {
+  it("shows a committed direct send as queued before its snapshot refresh returns", () => {
+    const initial = snapshot([message("user-1", [{ kind: "text", text: "Continue" }], 4)]);
+
+    const next = applyThreadSendReceipt(initial, {
+      botId: "bot-1",
+      runId: "run-receipt",
+      taskId: "task-receipt",
+      createdAt: "2026-09-03T21:29:52.000Z",
+    });
+
+    expect(next?.run).toMatchObject({
+      id: "run-receipt",
+      taskId: "task-receipt",
+      status: "queued",
+    });
+    expect(next?.activeRuns).toEqual([next?.run]);
+    expect(next?.messages).toBe(initial.messages);
+  });
+
+  it("does not replace authoritative active or group run state with a send receipt", () => {
+    const active = threadRun("run-active");
+    const direct: ThreadSnapshot = { ...snapshot([]), run: active, activeRuns: [active] };
+    const group: ThreadSnapshot = { ...snapshot([]), groupId: "group-1" };
+    const receipt = { botId: "bot-1", runId: "run-new", taskId: "task-new" };
+    const completed = { ...threadRun(receipt.runId), status: "completed" as const };
+
+    expect(applyThreadSendReceipt(direct, receipt)).toBe(direct);
+    expect(applyThreadSendReceipt(group, receipt)).toBe(group);
+    expect(applyThreadSendReceipt({ ...snapshot([]), run: completed }, receipt)?.run).toBe(
+      completed,
+    );
+    expect(applyThreadSendReceipt(snapshot([]), receipt, new Set([receipt.runId]))).toEqual(
+      snapshot([]),
+    );
+  });
+
+  it("applies a persisted thumbs-up event to its message", () => {
+    const initial = snapshot([message("message-1", [{ kind: "text", text: "Done" }], 1)]);
+
+    const next = reduceThreadSnapshot(
+      initial,
+      event({
+        type: "thread.message.reaction",
+        seq: 4,
+        payload: { messageId: "message-1", thumbsUp: true },
+      }),
+    );
+
+    expect(next?.messages[0]?.thumbsUp).toBe(true);
+    expect(next?.cursor).toBe(4);
+  });
+
   it("prepends older pages in order, removes overlaps, and advances the history cursor", () => {
     const initial = snapshot([message("m-2", [], 2), message("m-3", [], 3)], 2);
 
@@ -187,8 +242,32 @@ describe("thread event reduction", () => {
       }),
     );
 
-    expect(next?.messages.map((item) => item.id)).toEqual(["subagent:other", "durable"]);
-    expect(next?.messages[1]?.blocks).toEqual([completedBlock]);
+    expect(next?.messages.map((item) => item.id)).toEqual(["durable", "subagent:other"]);
+    expect(next?.messages[0]?.blocks).toEqual([completedBlock]);
+  });
+
+  it("keeps a replayed bot-to-bot marker in its durable transcript position", () => {
+    const peerBlock = {
+      kind: "bot_message_received" as const,
+      fromBotId: "bot-peer",
+      fromBotName: "Peer",
+      text: "Please check this.",
+    };
+    const initial = snapshot([
+      message("peer-message", [peerBlock], 1),
+      message("newer-message", [{ kind: "text", text: "Working on it." }], 2),
+    ]);
+
+    const next = reduceThreadSnapshot(
+      initial,
+      event({
+        type: "thread.message.created",
+        seq: 9,
+        payload: { messageId: "peer-message", role: "user", blocks: [peerBlock] },
+      }),
+    );
+
+    expect(next?.messages.map((item) => item.id)).toEqual(["peer-message", "newer-message"]);
   });
 
   it("clears durable and transient history when another client clears the thread", () => {
@@ -276,6 +355,19 @@ describe("thread event reduction", () => {
     );
 
     expect(started?.run?.trigger).toBe("bot_message");
+  });
+
+  it("preserves webhook when event-sourcing an inbound wake", () => {
+    const started = reduceThreadSnapshot(
+      snapshot([]),
+      event({
+        type: "run.started",
+        runId: "webhook-run-1",
+        payload: { trigger: "webhook" },
+      }),
+    );
+
+    expect(started?.run?.trigger).toBe("webhook");
   });
 
   it("marks the run as waiting when computer takeover is requested", () => {
@@ -520,6 +612,112 @@ describe("thread event reduction", () => {
     expect(next?.run).toEqual(runB);
     expect(next?.activeRuns).toEqual([runB]);
     expect(next?.cursor).toBe(10);
+  });
+
+  it("keeps a failed run and its error so the thread can surface the failure", () => {
+    const failing = threadRun("run-a");
+    const initial: ThreadSnapshot = {
+      ...snapshot([
+        { ...message("progress:run-a", [{ kind: "progress", text: "A" }]), runId: failing.id },
+      ]),
+      run: failing,
+    };
+    const failed = event({
+      type: "run.failed",
+      seq: 11,
+      runId: failing.id,
+      payload: { error: "Provider is not configured: openrouter" },
+    });
+
+    const next = reduceThreadSnapshot(initial, failed);
+
+    expect(next?.messages).toEqual([]);
+    expect(next?.run).toMatchObject({
+      id: failing.id,
+      status: "failed",
+      error: "Provider is not configured: openrouter",
+    });
+    expect(threadRunError(next)).toBe("Provider is not configured: openrouter");
+    expect(threadRunError(next, new Set([failing.id]))).toBeNull();
+    expect(threadRunError(next, new Set(["other-run"]))).toBe(
+      "Provider is not configured: openrouter",
+    );
+  });
+
+  it("keeps the error when a member run fails while another member is still running", () => {
+    const runA = threadRun("run-a", "bot-a");
+    const runB = threadRun("run-b", "bot-b");
+    const initial: ThreadSnapshot = {
+      ...snapshot([]),
+      run: runA,
+      activeRuns: [runA, runB],
+    };
+
+    const next = reduceThreadSnapshot(
+      initial,
+      event({
+        type: "run.failed",
+        seq: 13,
+        botId: "bot-b",
+        runId: runB.id,
+        payload: { error: "member exploded" },
+      }),
+    );
+
+    expect(next?.activeRuns).toEqual([runA]);
+    expect(next?.run).toMatchObject({ id: runB.id, status: "failed", error: "member exploded" });
+    expect(threadRunError(next)).toBe("member exploded");
+  });
+
+  it("keeps a group failure visible when another member starts before dismiss", () => {
+    const failed = {
+      ...threadRun("run-b", "bot-b"),
+      status: "failed" as const,
+      error: "member exploded",
+    };
+    const runA = threadRun("run-a", "bot-a");
+    const initial: ThreadSnapshot = {
+      ...snapshot([]),
+      groupId: "group-1",
+      run: failed,
+      activeRuns: [runA],
+    };
+
+    const next = reduceThreadSnapshot(
+      initial,
+      event({
+        type: "run.started",
+        seq: 14,
+        botId: "bot-c",
+        runId: "run-c",
+      }),
+    );
+
+    expect(next?.run).toMatchObject({ id: failed.id, status: "failed", error: "member exploded" });
+    expect(next?.activeRuns).toEqual([
+      runA,
+      expect.objectContaining({ id: "run-c", botId: "bot-c", status: "running" }),
+    ]);
+    expect(threadRunError(next)).toBe("member exploded");
+  });
+
+  it("clears the run and reports no error when it completes or fails without a message", () => {
+    const finishing = threadRun("run-a");
+    const initial: ThreadSnapshot = { ...snapshot([]), run: finishing };
+
+    const completed = reduceThreadSnapshot(
+      initial,
+      event({ type: "run.completed", seq: 12, runId: finishing.id }),
+    );
+    const blank = reduceThreadSnapshot(
+      initial,
+      event({ type: "run.failed", seq: 12, runId: finishing.id, payload: { error: "  " } }),
+    );
+
+    expect(completed?.run).toBeNull();
+    expect(threadRunError(completed)).toBeNull();
+    expect(blank?.run).toBeNull();
+    expect(threadRunError(blank)).toBeNull();
   });
 
   it("applies the durable waiting-input run transition without a refresh", () => {
@@ -1158,6 +1356,24 @@ describe("computer event reduction", () => {
     expect(computerPanelAutoUsesBoot("boot")).toBe(true);
     expect(computerPanelAutoUsesBoot("wait")).toBe(false);
   });
+
+  it("shows maintenance only after a stopped or errored computer finishes booting", () => {
+    expect(computerPanelNeedsMaintenance("error", false)).toBe(true);
+    expect(computerPanelNeedsMaintenance("stopped", false)).toBe(true);
+    expect(computerPanelNeedsMaintenance("error", true)).toBe(false);
+    expect(computerPanelNeedsMaintenance("running", false)).toBe(false);
+    expect(computerPanelNeedsMaintenance(undefined, false)).toBe(false);
+  });
+
+  it("hides side-panel maintenance while the computer overlay is open", () => {
+    const panel = "computer";
+    const booting = false;
+    const showInSidePanel = (computerOpen: boolean) =>
+      panel === "computer" && !computerOpen && computerPanelNeedsMaintenance("stopped", booting);
+
+    expect(showInSidePanel(false)).toBe(true);
+    expect(showInSidePanel(true)).toBe(false);
+  });
 });
 
 function snapshot(messages: ThreadMessage[], olderCursor: number | null = null): ThreadSnapshot {
@@ -1223,7 +1439,7 @@ function message(id: string, blocks: ThreadMessage["blocks"], seq = 3): ThreadMe
 function event(overrides: Partial<ProductEvent>): ProductEvent {
   return {
     id: "event-1",
-    workspaceId: "workspace-1",
+    spaceId: "workspace-1",
     threadId: "thread-1",
     botId: "bot-1",
     seq: 4,

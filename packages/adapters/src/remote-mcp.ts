@@ -8,6 +8,7 @@ import { combineSignals } from "./connector-safety.js";
 import { isLanAllowedHostname, isLanAllowedUrl } from "./mcp-lan-allowlist.js";
 import {
   createAddressCheckedLookup,
+  isCloudMetadataAddress,
   isPrivateAddress,
   type ResolvedAddress,
   type ResolveHostname,
@@ -138,7 +139,7 @@ export async function assertSafeRemoteUrl(
   const hostname = url.hostname.replace(/^\[|\]$/g, "");
   if (lanAllowed) return url;
   if (isPrivateHostname(hostname)) throw new Error("Connector URL targets a private host");
-  assertPublicAddresses(await resolve(hostname));
+  assertPublicAddresses(await resolve(hostname), hostname);
   return url;
 }
 
@@ -178,8 +179,25 @@ export function createSafeLookup(resolve: ResolveHostname = resolveHostname): Lo
   });
 }
 
+/** Tailscale MagicDNS names (*.ts.net) are public DNS names, not private IP literals. */
+function isTailscaleMagicDnsHostname(hostname: string): boolean {
+  const normalized = hostname.toLowerCase().replace(/\.$/, "");
+  return normalized === "ts.net" || normalized.endsWith(".ts.net");
+}
+
+/** Tailscale assigns CGNAT 100.64.0.0/10; MagicDNS may resolve there. */
+function isTailscaleCgnatAddress(address: string): boolean {
+  const value = address.toLowerCase().replace(/^\[|\]$/g, "");
+  const mapped = value.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/)?.[1];
+  const ipv4 = mapped ?? (isIP(value) === 4 ? value : undefined);
+  if (!ipv4) return false;
+  const [a, b] = ipv4.split(".").map(Number);
+  return a === 100 && b != null && b >= 64 && b <= 127;
+}
+
 function isPrivateHostname(hostname: string): boolean {
   const normalized = hostname.toLowerCase().replace(/\.$/, "");
+  if (isTailscaleMagicDnsHostname(normalized)) return false;
   return (
     normalized === "localhost" ||
     normalized.endsWith(".localhost") ||
@@ -190,8 +208,19 @@ function isPrivateHostname(hostname: string): boolean {
   );
 }
 
-function assertPublicAddresses(addresses: ResolvedAddress[]): void {
-  if (addresses.length === 0 || addresses.some((entry) => isPrivateAddress(entry.address))) {
+function assertPublicAddresses(addresses: ResolvedAddress[], hostname?: string): void {
+  if (addresses.length === 0) {
+    throw new Error("Connector URL resolves to a private address");
+  }
+  const magicDns = hostname != null && isTailscaleMagicDnsHostname(hostname);
+  if (
+    addresses.some((entry) => {
+      if (isCloudMetadataAddress(entry.address)) return true;
+      if (!isPrivateAddress(entry.address)) return false;
+      // Allow only Tailscale CGNAT for MagicDNS; keep other private ranges blocked.
+      return !(magicDns && isTailscaleCgnatAddress(entry.address));
+    })
+  ) {
     throw new Error("Connector URL resolves to a private address");
   }
 }

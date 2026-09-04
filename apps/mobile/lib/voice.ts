@@ -1,22 +1,39 @@
 import { File, Paths } from "expo-file-system";
-import { currentApiBase } from "./api";
-import { loadSessionToken } from "./session";
+import {
+  type ApiRequestContext,
+  authHeaders,
+  captureApiRequestContext,
+  currentApiBase,
+  rpc,
+} from "./api";
+import { t } from "./i18n";
 
-async function authHeaders(): Promise<Record<string, string>> {
-  const token = await loadSessionToken();
-  return token ? { authorization: `Bearer ${token}` } : {};
+type SpeechOptions = { voiceId?: string; botId?: string };
+
+export async function speakText(text: string, opts: SpeechOptions = {}): Promise<boolean> {
+  const requestContext = await captureApiRequestContext();
+  const prepared = await rpc<{ ready: boolean; utterances: string[] }>(
+    "voice/prepare",
+    { text, voiceId: opts.voiceId, botId: opts.botId },
+    { requestContext },
+  );
+  if (!prepared.ready) return false;
+  for (const utterance of prepared.utterances) {
+    await playMpeg(await speakUtterance(utterance, { ...opts, requestContext }));
+  }
+  return true;
 }
 
 export async function speakUtterance(
   text: string,
-  opts: { voiceId?: string; botId?: string } = {},
+  opts: SpeechOptions & { requestContext?: ApiRequestContext } = {},
 ): Promise<Uint8Array> {
-  const res = await fetch(`${currentApiBase()}/api/voice/speak`, {
+  const res = await fetch(`${opts.requestContext?.apiBase ?? currentApiBase()}/api/voice/speak`, {
     method: "POST",
     headers: {
       "content-type": "application/json",
       origin: "rakazo://",
-      ...(await authHeaders()),
+      ...(opts.requestContext?.headers ?? (await authHeaders())),
     },
     body: JSON.stringify({ text, voiceId: opts.voiceId, botId: opts.botId }),
   });
@@ -44,7 +61,7 @@ async function playWithHtmlAudio(AudioCtor: typeof Audio, bytes: Uint8Array): Pr
     await audio.play();
     await new Promise<void>((resolve, reject) => {
       audio.onended = () => resolve();
-      audio.onerror = () => reject(new Error("Could not play that clip."));
+      audio.onerror = () => reject(new Error(t("Could not play that clip.")));
     });
   } finally {
     URL.revokeObjectURL(url);
@@ -65,7 +82,7 @@ async function playWithNativeAudio(bytes: Uint8Array): Promise<void> {
   try {
     await new Promise<void>((resolve, reject) => {
       let settled = false;
-      let timer = setTimeout(() => finish(new Error("Could not play that clip.")), 15_000);
+      let timer = setTimeout(() => finish(new Error(t("Could not play that clip."))), 15_000);
       const finish = (error?: Error) => {
         if (settled) return;
         settled = true;
@@ -80,7 +97,7 @@ async function playWithNativeAudio(bytes: Uint8Array): Promise<void> {
           return;
         }
         if (status.playbackState === "failed") {
-          finish(new Error("Could not play that clip."));
+          finish(new Error(t("Could not play that clip.")));
           return;
         }
         if (status.didJustFinish) {
@@ -90,7 +107,7 @@ async function playWithNativeAudio(bytes: Uint8Array): Promise<void> {
         if (status.playing && status.duration > 0) {
           clearTimeout(timer);
           timer = setTimeout(
-            () => finish(new Error("Could not play that clip.")),
+            () => finish(new Error(t("Could not play that clip."))),
             Math.min(120_000, Math.ceil(status.duration * 1000) + 8_000),
           );
         }
@@ -98,7 +115,7 @@ async function playWithNativeAudio(bytes: Uint8Array): Promise<void> {
       try {
         player.play();
       } catch (error) {
-        finish(error instanceof Error ? error : new Error("Could not play that clip."));
+        finish(error instanceof Error ? error : new Error(t("Could not play that clip.")));
       }
     });
   } finally {
