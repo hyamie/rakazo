@@ -23,7 +23,8 @@ import { isToolPauseResult } from "./approval-effect.js";
 import { builtinAgentTools, DELEGATION_TOOL_NAMES } from "./builtin-tools.js";
 import { resolveDeploymentModel } from "./deployment-model.js";
 import { PiRuntimeCredentialStore, toOAuthCredential } from "./pi-credentials.js";
-import { registerLocalProvider } from "./pi-local-provider.js";
+import { LOCAL_PROVIDER_ID, localApiKey, registerLocalProvider } from "./pi-local-provider.js";
+import { isProviderAllowed, PROVIDER_ALLOWLIST_ENV } from "./pi-models.js";
 import {
   OPENAI_COMPATIBLE_PROVIDER_ID,
   registerOpenAiCompatibleCatalog,
@@ -31,8 +32,6 @@ import {
 } from "./pi-openai-compatible-provider.js";
 import { textContentArg } from "./tool-text.js";
 
-import { isProviderAllowed, PROVIDER_ALLOWLIST_ENV } from "./pi-models.js";
-import { LOCAL_PROVIDER_ID, localApiKey } from "./pi-local-provider.js";
 const running = new Map<string, AbortController>();
 // Built on first use, not at module load: entry points call loadRootEnv() after
 // their imports, and ESM hoists those imports, so module-level env reads here
