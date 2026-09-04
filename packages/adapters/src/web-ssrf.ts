@@ -171,11 +171,13 @@ async function followRedirects(
       await cancelResponseBody(response, state.signal);
       throw new Error("Redirect missing Location header");
     }
-    const next = new URL(location, validated.href).href;
+    const next = new URL(location, validated.href);
+    const headers = next.origin === validated.origin ? state.headers : undefined;
     // Release this hop before following — do not leave the body open across recursion.
     await cancelResponseBody(response, state.signal);
-    return followRedirects(next, {
+    return followRedirects(next.href, {
       ...state,
+      headers,
       redirectsRemaining: state.redirectsRemaining - 1,
     });
   }

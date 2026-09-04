@@ -66,6 +66,10 @@ let openAppPromise: Promise<boolean> | null = null;
 let pendingPreviousWindow: BrowserWindow | null = null;
 let quitting = false;
 let warmWindowTimer: NodeJS.Timeout | undefined;
+// Number of short-lived hidden probe windows currently alive. On Windows/Linux,
+// destroying the last window fires "window-all-closed" -> app.quit(); a probe
+// that runs before the first real window exists must not count as "all closed".
+let liveProbeWindows = 0;
 const WARM_WINDOW_TTL_MS = warmWindowTtlMs(process.env.RAKAZO_WARM_WINDOW_TTL_MS);
 
 const updaterEnvironment = {
@@ -177,6 +181,9 @@ async function defaultSessionHasOriginData(origin: string): Promise<boolean> {
       sandbox: true,
     },
   });
+  // Increment only after construction succeeds so a throw cannot leave the
+  // counter stuck > 0 and permanently block quit on Windows/Linux.
+  liveProbeWindows++;
   try {
     await probe.loadURL(origin);
     return (await probe.webContents.executeJavaScript(`(async () => {
@@ -199,6 +206,7 @@ async function defaultSessionHasOriginData(origin: string): Promise<boolean> {
     return false;
   } finally {
     if (!probe.isDestroyed()) probe.destroy();
+    liveProbeWindows--;
   }
 }
 
@@ -780,10 +788,13 @@ async function openAppOnce(targetUrl: string) {
     return true;
   } catch (error) {
     pendingPreviousWindow = null;
-    if (win !== null && !win.isDestroyed()) win.destroy();
     // Keep the previous app window so Cancel / close can restore it.
     if (previous !== null && !previous.isDestroyed()) mainWindow = previous;
+    // Show the setup window BEFORE destroying the failed one: on Windows/Linux,
+    // destroying the last window fires "window-all-closed" -> app.quit() before
+    // showSetupWindow() runs, so the app silently exits instead of showing this error.
     showSetupWindow(`Could not open that server. ${openFailureDetail(error)}`);
+    if (win !== null && !win.isDestroyed()) win.destroy();
     return false;
   }
 }
@@ -1148,6 +1159,9 @@ app.whenReady().then(async () => {
 });
 
 app.on("window-all-closed", () => {
+  // A hidden session probe (defaultSessionHasOriginData) can be the only window
+  // during startup; its teardown must not quit the app.
+  if (liveProbeWindows > 0) return;
   if (process.platform !== "darwin") app.quit();
 });
 
