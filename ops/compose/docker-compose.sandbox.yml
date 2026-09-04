@@ -35,9 +35,21 @@ services:
     restart: "no"
 
   supervisor:
-    build:
-      context: ../..
-      dockerfile: infra/sandboxes/supervisor/Dockerfile
+    # Runs from the application image, the way upstream's own
+    # docker-compose.images.yml does, NOT from infra/sandboxes/supervisor/Dockerfile.
+    #
+    # That Dockerfile does not install the supervisor's workspace dependencies. It
+    # was survivable while the supervisor only imported @rakazo/core, and it stopped
+    # being survivable when upstream added @rakazo/logging to its imports: the
+    # container crash-loops on ERR_MODULE_NOT_FOUND for a package that is declared
+    # right there in infra/sandboxes/supervisor/package.json. The app image already
+    # contains the whole workspace, so `pnpm --filter` just runs it.
+    #
+    # This also means a future updater rollback covers the supervisor, because it
+    # moves with RAKAZO_IMAGE_TAG like api, worker and web.
+    image: ${RAKAZO_IMAGE:-ghcr.io/elie222/rakazo/app}:${RAKAZO_IMAGE_TAG:-local}
+    command: ["pnpm", "--filter", "@rakazo/sandbox-supervisor", "start"]
+    user: root
     restart: unless-stopped
     init: true
     # No `cap_drop: ALL` and no `no-new-privileges` here, unlike its siblings:
