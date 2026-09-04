@@ -46,6 +46,32 @@ jobs:
             -f ops/compose/docker-compose.sandbox.yml \
             config --quiet
 
+      # The supervisor must run from the application image, not from
+      # infra/sandboxes/supervisor/Dockerfile, which does not install its
+      # workspace dependencies. That distinction is invisible in a render and
+      # only shows up as an ERR_MODULE_NOT_FOUND crash-loop on the deployment,
+      # which is exactly how it was found: upstream added @rakazo/logging to the
+      # supervisor and the standalone image stopped booting.
+      - name: Assert the supervisor runs from the application image
+        run: |
+          docker compose --env-file .env \
+            -f infra/compose/docker-compose.prod.yml \
+            -f ops/compose/docker-compose.sandbox.yml config --format json > /tmp/rendered.json
+          python3 - <<'PY'
+          import json, sys
+          svc = json.load(open("/tmp/rendered.json"))["services"]
+          api, sup = svc["api"], svc["supervisor"]
+          print("api image:", api.get("image"), "| supervisor image:", sup.get("image"))
+          ok = True
+          if sup.get("image") != api.get("image"):
+              print(f"::error::supervisor image {sup.get('image')!r} must match api {api.get('image')!r}")
+              ok = False
+          if sup.get("build") is not None:
+              print("::error::the supervisor must not be built from its own Dockerfile; it lacks the workspace deps")
+              ok = False
+          sys.exit(0 if ok else 1)
+          PY
+
       # The overlay's whole job is grafting the supervisor and the computer image
       # onto the prod stack. A rename or a stray profile upstream would drop them
       # silently, and `config --quiet` would still pass.
