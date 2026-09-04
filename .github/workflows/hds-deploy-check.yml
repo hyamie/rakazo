@@ -1,0 +1,62 @@
+# Fork-only. Upstream has no file by this name, so it never conflicts on a sync.
+#
+# The deployment runs two compose files, and nothing upstream renders that pair.
+# A new `${VAR:?...}` in the prod file, or a change that makes the overlay stop
+# resolving against it, would otherwise be found by `deploy.sh` on the box.
+name: hds-deploy-check
+
+on:
+  pull_request:
+    branches: [deploy/hds]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compose-config:
+    name: Render the deployment compose files
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      # Both compose files declare `env_file: ../../.env`, which --env-file does
+      # not satisfy: it supplies interpolation, not the file the service reads.
+      # Without this the render fails on a missing file rather than on anything
+      # this check is meant to catch.
+      - name: Stage a dummy environment
+        run: cp ops/ci/compose-check.env .env
+
+      # The overlay needs a certificate at a path Docker would otherwise create
+      # as a directory. Contents are irrelevant to `config`; presence is not.
+      - name: Stage the qmd CA placeholder
+        run: |
+          mkdir -p ops/certs
+          printf 'not a certificate, present only so the bind mount resolves\n' \
+            > ops/certs/qmd-gateway.crt
+
+      # Project directory comes from the FIRST -f file, so both paths resolve the
+      # way deploy.sh resolves them. Do not add --project-directory.
+      - name: Render both files
+        run: |
+          docker compose --env-file .env \
+            -f infra/compose/docker-compose.prod.yml \
+            -f ops/compose/docker-compose.sandbox.yml \
+            config --quiet
+
+      # The overlay's whole job is grafting the supervisor and the computer image
+      # onto the prod stack. A rename or a stray profile upstream would drop them
+      # silently, and `config --quiet` would still pass.
+      - name: Assert the overlay's services survive the merge
+        run: |
+          services="$(docker compose --env-file .env \
+            -f infra/compose/docker-compose.prod.yml \
+            -f ops/compose/docker-compose.sandbox.yml \
+            config --services)"
+          echo "$services"
+          for required in api worker web supervisor computer; do
+            printf '%s\n' "$services" | grep -qx "$required" \
+              || { echo "::error::the rendered stack has no '$required' service"; exit 1; }
+          done
