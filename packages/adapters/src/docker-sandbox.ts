@@ -15,12 +15,21 @@ import type {
   ScreenSession,
 } from "@rakazo/adapter-kit";
 import { boundedSandboxCommandTimeoutMs, resolveSupervisorToken } from "@rakazo/core";
+import { outgoingCorrelationHeaders } from "@rakazo/logging";
 import {
   boundedComputerActions,
   clampRounded,
   computerObservation,
   normalizeWorkspacePath,
 } from "./computer-support.js";
+
+async function safeBody(res: Response): Promise<string> {
+  try {
+    return (await res.text()).slice(0, 200);
+  } catch {
+    return "";
+  }
+}
 
 export class DockerSandboxProvider implements SandboxProvider {
   private readonly supervisorToken: string;
@@ -66,9 +75,11 @@ export class DockerSandboxProvider implements SandboxProvider {
   private headers(context: AdapterContext, botId?: string) {
     return {
       authorization: `Bearer ${this.supervisorToken}`,
-      "x-rakazo-workspace-id": context.workspaceId,
+      "x-rakazo-space-id": context.spaceId,
+      ...outgoingCorrelationHeaders(),
       ...(botId ? { "x-rakazo-bot-id": botId } : {}),
       ...(context.screenLeaseId ? { "x-rakazo-screen-lease-id": context.screenLeaseId } : {}),
+      ...(context.cancelRunWork ? { "x-rakazo-cancel-run-work": "1" } : {}),
     };
   }
 
@@ -82,7 +93,7 @@ export class DockerSandboxProvider implements SandboxProvider {
       body: JSON.stringify({
         botId: request.botId,
         homePath: request.homePath,
-        workspaceId: context.workspaceId,
+        spaceId: context.spaceId,
       }),
       signal: context.signal,
     });
@@ -336,19 +347,26 @@ export class DockerSandboxProvider implements SandboxProvider {
   }
 
   async stop(computer: ComputerRef, context: AdapterContext): Promise<void> {
-    await fetch(this.url(`/computers/${computer.id}/stop`), {
+    const res = await fetch(this.url(`/computers/${computer.id}/stop`), {
       method: "POST",
       headers: this.headers(context, computer.botId),
       signal: context.signal,
     });
+    // 404 means the supervisor no longer has the container, which is the state we want.
+    if (!res.ok && res.status !== 404) {
+      throw new Error(`sandbox stop failed: ${res.status} ${await safeBody(res)}`.trim());
+    }
   }
 
   async destroy(computer: ComputerRef, context: AdapterContext): Promise<void> {
-    await fetch(this.url(`/computers/${computer.id}`), {
+    const res = await fetch(this.url(`/computers/${computer.id}`), {
       method: "DELETE",
       headers: this.headers(context, computer.botId),
       signal: context.signal,
     });
+    if (!res.ok && res.status !== 404) {
+      throw new Error(`sandbox destroy failed: ${res.status} ${await safeBody(res)}`.trim());
+    }
   }
 
   private async *walkWorkspace(

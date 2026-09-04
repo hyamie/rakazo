@@ -61,7 +61,7 @@ describe("scripted placeholder on a provider-pinned deployment", () => {
       {
         operationId: "operation",
         traceId: "trace",
-        workspaceId: "workspace",
+        spaceId: "workspace",
         userId: "user",
         signal: new AbortController().signal,
       },

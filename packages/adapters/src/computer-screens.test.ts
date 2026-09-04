@@ -11,7 +11,7 @@ import { FakeSandboxProvider } from "./fake-sandbox.js";
 const writer = {
   operationId: "1",
   traceId: "1",
-  workspaceId: "w",
+  spaceId: "w",
   userId: "u",
   botId: "writer",
   signal: new AbortController().signal,
@@ -74,10 +74,10 @@ describe("Team Computer parallel screens", () => {
     claims.claim("computer-1", oldRun);
     claims.claim("computer-1", newRun);
 
-    claims.release("computer-1", oldRun);
+    expect(claims.release("computer-1", oldRun)).toBe(false);
     expect(() => claims.claim("computer-1", researcher)).toThrow(ComputerScreenUnavailableError);
 
-    claims.release("computer-1", newRun);
+    expect(claims.release("computer-1", newRun)).toBe(true);
     expect(() => claims.claim("computer-1", researcher)).not.toThrow();
   });
 
@@ -110,7 +110,7 @@ describe("Team Computer parallel screens", () => {
         claims.claim("computer-1", researcher);
         return "ok";
       }),
-    ).resolves.toEqual({ error: expect.stringMatching(/does not support multiple screens/) });
+    ).resolves.toEqual({ error: expect.stringMatching(/temporarily busy/) });
     expect(isComputerScreenUnavailable(new Error("cannot allocate another screen"))).toBe(true);
   });
 

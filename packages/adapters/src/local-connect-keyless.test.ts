@@ -31,9 +31,9 @@ describe("connecting the local provider without pasting a key", () => {
   it("still prefers a key the operator did paste", async () => {
     await withKey("sk-gateway-token-value", async () => {
       const { buildModelConnectPlaintext } = await import("./model-connect.js");
-      expect(
-        buildModelConnectPlaintext({ provider: "local", apiKey: "sk-pasted-override" }),
-      ).toBe("sk-pasted-override");
+      expect(buildModelConnectPlaintext({ provider: "local", apiKey: "sk-pasted-override" })).toBe(
+        "sk-pasted-override",
+      );
     });
   });
 
