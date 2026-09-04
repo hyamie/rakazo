@@ -55,7 +55,10 @@ export const COMPUTER_BIND_HOST = process.env.RAKAZO_COMPUTER_BIND_HOST ?? "127.
  */
 const DEFAULT_COMPUTER_MEMORY = "2g";
 const DEFAULT_COMPUTER_CPUS = "2";
-const DEFAULT_COMPUTER_PIDS_LIMIT = "512";
+// #343's chosen ceiling, kept as the default so this fork does not quietly retune
+// a number upstream picked. This deployment overrides it to 512 in
+// ops/compose/docker-compose.sandbox.yml, where the sizing sits next to its host.
+const DEFAULT_COMPUTER_PIDS_LIMIT = "2048";
 /** The daemon refuses HostConfig.Memory below this at container creation. */
 const MIN_DOCKER_MEMORY_BYTES = 6 * 1024 ** 2;
 

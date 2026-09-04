@@ -75,21 +75,22 @@ services:
       # boundary, so a 64 GB tree mounted inside it would be walked and copied on
       # every run. computerExtraMounts() refuses such a target outright.
       RAKAZO_COMPUTER_EXTRA_MOUNTS: ${RAKAZO_COMPUTER_EXTRA_MOUNTS:-/mnt/projects:/mnt/projects:ro,/var/rakazo/botwork:/mnt/work:rw}
-      # The screen URL is loaded by a browser on Mike's laptop, not from inside
-      # the compose network, so the supervisor must hand back the published host
-      # mapping. Leaving SANDBOX_SCREEN_NETWORK unset keeps that default; the
-      # `internal` value returns a 172.x container IP no external browser can
-      # reach.
-      # These two must name the SAME address, and it must be one the supervisor
-      # and web containers can reach. BIND_HOST is where the bot computer's
-      # screen ports are published; SCREEN_HOST is where the supervisor probes
-      # for readiness and what the screen proxy is pointed at. Loopback (the
-      # upstream default) is not the host from inside a container, so the probe
-      # hangs its full timeout on every run and the bot never answers.
-      # The docker bridge gateway is the right value: siblings reach it, and
-      # unlike 0.0.0.0 it keeps an unauthenticated VNC port off the LAN.
-      RAKAZO_COMPUTER_BIND_HOST: ${RAKAZO_COMPUTER_BIND_HOST:-172.17.0.1}
-      SANDBOX_SCREEN_HOST: ${SANDBOX_SCREEN_HOST:-172.17.0.1}
+      # Screens are reached through the `web` container, never through a host
+      # port. In `isolated` mode the supervisor puts each bot computer on its own
+      # bridge network and attaches `web` to it (connectComposeScreenPeers finds
+      # the container labelled com.docker.compose.service=web in this project),
+      # then hands back the computer's container IP. `web` is the only thing that
+      # dials it, and Caddy already fronts `web` for the browser.
+      #
+      # This replaces the RAKAZO_COMPUTER_BIND_HOST / SANDBOX_SCREEN_HOST pair
+      # this overlay used to carry. Those existed because the upstream default
+      # published the screen on loopback, which is not the host from inside a
+      # container, so the readiness probe hung its full timeout on every run and
+      # the bot never answered; pinning both to the docker bridge gateway fixed
+      # that at the cost of an unauthenticated VNC port on the host. Isolated
+      # mode removes the port entirely, so it is strictly better and both
+      # variables are now dead here.
+      SANDBOX_SCREEN_NETWORK: ${SANDBOX_SCREEN_NETWORK:-isolated}
       SANDBOX_SUPERVISOR_TOKEN: ${SANDBOX_SUPERVISOR_TOKEN:?Set SANDBOX_SUPERVISOR_TOKEN in .env}
       # Per-computer ceilings. Rakazo leaves bot computers uncapped upstream;
       # feat/sandbox-resource-limits adds these and they are set explicitly here

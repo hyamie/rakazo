@@ -175,7 +175,10 @@ export function createSafeLookup(resolve: ResolveHostname = resolveHostname): Lo
   // refused here, at the socket.
   return createAddressCheckedLookup(resolve, (addresses, hostname) => {
     if (isLanAllowedHostname(hostname)) return;
-    assertPublicAddresses(addresses);
+    // Pass the hostname through: assertPublicAddresses needs it to allow
+    // Tailscale MagicDNS resolving into CGNAT. Dropping it here silently
+    // disabled that and blocked every *.ts.net connector.
+    assertPublicAddresses(addresses, hostname);
   });
 }
 

@@ -520,7 +520,7 @@ describe("computer resource limits", () => {
     expect(HostConfig.Memory).toBe(2 * 1024 ** 3);
     expect(HostConfig.MemorySwap).toBe(HostConfig.Memory);
     expect(HostConfig.NanoCpus).toBe(2 * 1e9);
-    expect(HostConfig.PidsLimit).toBe(512);
+    expect(HostConfig.PidsLimit).toBe(2048);
   });
 
   it("pins MemorySwap to Memory so the ceiling cannot be swapped past", () => {
@@ -574,7 +574,7 @@ describe("computer resource limits", () => {
     const { HostConfig } = containerCreateOptions(createInput);
     expect(HostConfig.CapDrop).toEqual(["ALL"]);
     expect(HostConfig.SecurityOpt).toEqual(["no-new-privileges:true"]);
-    expect(HostConfig.PidsLimit).toBe(512);
+    expect(HostConfig.PidsLimit).toBe(2048);
   });
 
   it("parses byte counts without a unit suffix", () => {
