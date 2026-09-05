@@ -47,6 +47,7 @@ import {
   McpOAuthBroker,
   type MemoryProviderResolver,
   mapScratchpadItem,
+  memoryProviderRequiresDeploymentOwner,
   modelCredentialDto,
   type PiOAuthLogins,
   planLiveConnectionSync,
@@ -1428,6 +1429,14 @@ export function createRouter(deps: RouterDeps) {
           throw new ORPCError("BAD_REQUEST", { message: "computer must be running" });
         }
         if (hasActiveComputerControl(bot.computer) && bot.computer.controlBotId === bot.id) {
+          await bindWaitingTakeoverToControl(deps, {
+            spaceId: context.actor.spaceId,
+            threadId: bot.thread?.id,
+            botId: bot.id,
+            computerId: bot.computer.id,
+            controlLeaseId: bot.computer.controlLeaseId!,
+            controlRunId: bot.computer.controlRunId,
+          });
           await scheduleComputerControlExpiry(
             deps.jobs,
             bot.computer.id,
@@ -1511,7 +1520,17 @@ export function createRouter(deps: RouterDeps) {
           const current = await deps.prisma.computer.findUniqueOrThrow({
             where: { id: bot.computer.id },
           });
-          if (!hasActiveComputerControl(current)) throw new ORPCError("CONFLICT");
+          if (!hasActiveComputerControl(current) || current.controlBotId !== bot.id) {
+            throw new ORPCError("CONFLICT", { message: "Computer control changed; try again" });
+          }
+          await bindWaitingTakeoverToControl(deps, {
+            spaceId: context.actor.spaceId,
+            threadId: bot.thread?.id,
+            botId: bot.id,
+            computerId: current.id,
+            controlLeaseId: current.controlLeaseId!,
+            controlRunId: current.controlRunId,
+          });
           await scheduleComputerControlExpiry(
             deps.jobs,
             current.id,
@@ -3819,6 +3838,68 @@ async function expireStaleComputerControl(
   return clearInactiveUserComputerControl(deps.prisma, computer.id).catch(() => false);
 }
 
+/** When the user already holds control during waiting_takeover, bind controlRunId so
+ * takeoverRequested becomes true and release can resume the waiting run. */
+async function bindWaitingTakeoverToControl(
+  deps: RouterDeps,
+  input: {
+    spaceId: string;
+    threadId: string | null | undefined;
+    botId: string;
+    computerId: string;
+    controlLeaseId: string;
+    controlRunId: string | null;
+  },
+): Promise<void> {
+  await deps.prisma.$transaction(async (tx) => {
+    // Lock the execution lease so a reclaimed fence/run cannot be bound by a stale read.
+    const locked = await tx.$queryRaw<Array<{ runId: string; fence: number }>>`
+      SELECT "runId", fence FROM computer_execution_leases
+      WHERE "computerId" = ${input.computerId} AND "botId" = ${input.botId}
+      FOR UPDATE`;
+    const executionLease = locked[0];
+    if (!executionLease) return;
+
+    const executionRun = await tx.run.findUnique({
+      where: { id: executionLease.runId },
+      select: { botId: true, status: true },
+    });
+    const waitingForTakeover =
+      executionRun?.botId === input.botId && executionRun.status === "waiting_takeover";
+    if (!waitingForTakeover) return;
+    if (input.controlRunId === executionLease.runId) return;
+
+    // Confirm the locked lease row still matches before writing controlRunId.
+    const leaseStillCurrent = await tx.computerExecutionLease.count({
+      where: {
+        computerId: input.computerId,
+        botId: input.botId,
+        runId: executionLease.runId,
+        fence: executionLease.fence,
+      },
+    });
+    if (leaseStillCurrent !== 1) return;
+
+    const bound = await tx.computer.updateMany({
+      where: {
+        id: input.computerId,
+        controlLeaseId: input.controlLeaseId,
+        controlBotId: input.botId,
+      },
+      data: { controlRunId: executionLease.runId },
+    });
+    if (bound.count !== 1 || !input.threadId) return;
+
+    await deps.events.append({
+      spaceId: input.spaceId,
+      threadId: input.threadId,
+      botId: input.botId,
+      type: "computer.takeover.granted",
+      payload: { leaseId: input.controlLeaseId, takeoverRequested: true },
+    });
+  });
+}
+
 async function computerScreenContext(
   prisma: PrismaClient,
   actor: Actor,
@@ -3957,11 +4038,21 @@ export async function persistMemoryProviderConfig(
   },
 ) {
   await requireSpaceOwner(deps.prisma, actor);
-  const prepared = await prepareMemoryProviderConnection(input).catch((error: unknown) => {
+  let prepared: Awaited<ReturnType<typeof prepareMemoryProviderConnection>>;
+  try {
+    if (
+      memoryProviderRequiresDeploymentOwner(input.provider, input.settings) &&
+      !actor.isDeploymentOwner
+    ) {
+      throw new ORPCError("FORBIDDEN");
+    }
+    prepared = await prepareMemoryProviderConnection(input);
+  } catch (error) {
+    if (error instanceof ORPCError) throw error;
     throw new ORPCError("BAD_REQUEST", {
       message: error instanceof Error ? error.message : "Memory provider connection failed",
     });
-  });
+  }
   const stored = await deps.secrets.put(JSON.stringify(prepared.credentials), {
     operationId: "memory-provider-config",
     traceId: "memory-provider-config",
