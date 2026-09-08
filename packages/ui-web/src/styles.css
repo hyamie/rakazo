@@ -17,6 +17,8 @@
   --color-primary-foreground: var(--primary-foreground);
   --color-secondary: var(--secondary);
   --color-secondary-foreground: var(--secondary-foreground);
+  --color-chat-user: var(--chat-user);
+  --color-chat-user-foreground: var(--chat-user-foreground);
   --color-muted: var(--muted);
   --color-muted-foreground: var(--muted-foreground);
   --color-accent: var(--accent);
@@ -163,6 +165,7 @@
   animation: rakazo-organic-eyes-loop-3 7.8s ease-in-out -2.1s infinite;
 }
 
+/* Durations mirror @rakazo/core WORKING_AVATAR_DURATIONS_MS (avatar-motion). */
 .rakazo-organic-avatar[data-shape-family="0"] .rakazo-organic-avatar-body-working {
   animation: rakazo-organic-float 1.8s ease-in-out infinite;
 }

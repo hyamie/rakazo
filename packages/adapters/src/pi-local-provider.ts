@@ -95,6 +95,7 @@ function localModel(id: string): Model<"openai-completions"> {
     provider: LOCAL_PROVIDER_ID,
     baseUrl: localBaseUrl(),
     reasoning: false,
+    compat: { supportsDeveloperRole: false, supportsReasoningEffort: false },
     input: inputModalities(localVisionModelIds().has(id)),
     // Runs on the operator's own hardware, so there is nothing to bill.
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },

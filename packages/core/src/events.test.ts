@@ -3,6 +3,7 @@ import {
   appendTextSegment,
   appendToolCallSegment,
   appendToolStep,
+  containsSecret,
   createStreamingRedactor,
   endsSentence,
   humanizeToolName,
@@ -15,6 +16,17 @@ import {
   trackToolCallStreak,
   trackToolNameStreak,
 } from "./events.js";
+
+describe("containsSecret", () => {
+  it("detects secrets that JSON escaping changes", () => {
+    expect(containsSecret({ 'api"key': { nested: 'api"key' } }, ['api"key'])).toBe(true);
+    expect(containsSecret({ nested: ["line\nbreak"] }, ["line\nbreak"])).toBe(true);
+  });
+
+  it("does not confuse escaped text with the original control character", () => {
+    expect(containsSecret({ value: "literal\\ntext" }, ["\n"])).toBe(false);
+  });
+});
 
 describe("isRunTerminalEvent", () => {
   it("recognizes every terminal run outcome", () => {
@@ -707,7 +719,9 @@ describe("sanitizeUtf16ForJson", () => {
     expect(
       sanitizeJsonValue({
         outer: {
+          // biome-ignore lint/complexity/useLiteralKeys: keep computed keys so unpaired surrogates stay intentional fixtures
           ["meta\uD83D"]: "ok",
+          // biome-ignore lint/complexity/useLiteralKeys: keep computed keys so unpaired surrogates stay intentional fixtures
           ["meta\uDE00"]: "also",
         },
       }),

@@ -15,6 +15,7 @@ import {
   runJobKey,
   type SandboxProvider,
 } from "@rakazo/adapter-kit";
+import type { IntegrationProviderSettings } from "@rakazo/adapters";
 import {
   acquireComputerExecutionLease,
   applyTeachingDesktopInput,
@@ -29,6 +30,7 @@ import {
   checkpointAndRecordComputerWorkspace,
   clearInactiveUserComputerControl,
   computerSupportsUpdate,
+  computerUpdateView,
   createVoiceProvider,
   deletePushToken,
   deploymentAutoReviewDefault,
@@ -51,9 +53,10 @@ import {
   type PiOAuthLogins,
   planLiveConnectionSync,
   prepareApiInstall,
-  prepareMemoryProviderConnection,
+  prepareGraphqlInstall,
   probeOpenAiCompatibleModels,
   provisionComputer,
+  queueComputerUpdate,
   type RemoteConnectorDependencies,
   releaseComputerExecutionLease,
   replaceComputer,
@@ -68,7 +71,6 @@ import {
   serializeModelSecret,
   takeoverLeaseMs,
   toComputerRef,
-  toStringRecord,
   touchRunningComputer,
   verifyMcpInstall,
 } from "@rakazo/adapters";
@@ -77,6 +79,7 @@ import {
   type Actor,
   appContract,
   type ComputerStatus,
+  IntegrationProviderIdSchema,
   type McpServer,
   type Me,
   OPENAI_COMPATIBLE_PROVIDER_ID,
@@ -93,10 +96,15 @@ import {
 } from "@rakazo/core";
 import {
   appendEventInTransaction,
+  CannotDeleteDefaultSpaceError,
+  CannotDeleteLastSpaceError,
+  CannotDeleteSpaceAsNonOwnerError,
+  createExternalConversationRepos,
   createGroupRepos,
   createRepos,
   createSpaceForMember,
   createThreadMessageInTransaction,
+  deleteEmptySpaceForMember,
   deleteUnreferencedCredentialSecret,
   findDefaultModelCredential,
   findDefaultVoiceCredential,
@@ -106,6 +114,7 @@ import {
   InvalidSpaceNameError,
   IsolationError,
   issueMessagingLinkCode,
+  listDeletableSpaceComputers,
   lockOwnedGroup,
   newestModelCredentialOrder,
   newestVoiceCredentialOrder,
@@ -113,20 +122,31 @@ import {
   type PrismaClient,
   parseComputerMode,
   SpaceLimitError,
+  SpaceNotEmptyError,
+  SpaceNotFoundError,
   selectSpaceModelPreference,
   selectSpaceVoicePreference,
   type ThreadEvents,
   touchGroupUpdatedAt,
 } from "@rakazo/db";
 import { getLogger } from "@rakazo/logging";
+import { deleteAgentSecret, listAgentSecrets, putAgentSecret } from "./agent-secrets.js";
 import { createAgentSkillsService } from "./agent-skills.js";
 import { createOwnedArtifact, getOwnedArtifact, getSpaceArtifact } from "./artifacts.js";
+import { botProfileLabelsChanged, commitBotUpdate } from "./bot-update.js";
 import {
   executionBlocksUserTakeover,
   resolveBusyBotName,
   toComputerStatus,
 } from "./computer-status.js";
+import { searchIntegrationCatalog } from "./integration-catalog.js";
 import { buildMcpUpdateMaterial } from "./mcp-material.js";
+import {
+  disconnectMemoryProvider,
+  persistMemoryProviderConfig,
+  serializeSpaceMemoryConfig,
+  updateMemoryProviderDefaultScope,
+} from "./memory-provider-config.js";
 import {
   chooseFocus,
   dismissFocus,
@@ -146,7 +166,12 @@ import {
   UpdaterProxyError,
 } from "./server-update.js";
 import { assertTeachingSendAllowed, createTaughtSkillsService } from "./taught-skills.js";
-import { isPeerRun, loadAllMessages, loadMessagePage } from "./thread-message-pages.js";
+import {
+  isPeerRun,
+  loadAllMessages,
+  loadMessagePage,
+  shouldForwardPeerThreadEvent,
+} from "./thread-message-pages.js";
 import {
   reactToThreadMessage,
   resolveThreadTarget,
@@ -224,6 +249,65 @@ async function reconcilePendingConnections(
       : []),
   ];
   if (updates.length > 0) await prisma.$transaction(updates);
+}
+
+/** Serialize begin/revoke for one user+provider so slug-wide remote deletes cannot race a new connect. */
+
+function isAmbiguousRemoteRevokeFailure(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const name = "name" in error && typeof error.name === "string" ? error.name : "";
+  if (name === "TimeoutError" || name === "AbortError") return true;
+  const message = error instanceof Error ? error.message : String(error);
+  return /timeout|timed out|aborted|network|ECONNRESET|ECONNREFUSED|fetch failed/i.test(message);
+}
+
+/** True when a connector failed before issuing any remote DELETE. */
+function isRemoteRevokePreDeleteFailure(error: unknown): boolean {
+  return Boolean(
+    error &&
+      typeof error === "object" &&
+      "remoteRevokePreDelete" in error &&
+      (error as { remoteRevokePreDelete?: boolean }).remoteRevokePreDelete === true,
+  );
+}
+
+function shouldRestoreLocalAfterRemoteRevokeFailure(error: unknown): boolean {
+  // Pre-delete list/network failures never reached DELETE — always keep retry state.
+  // Post-delete timeouts stay ambiguous and leave the row revoked.
+  return isRemoteRevokePreDeleteFailure(error) || !isAmbiguousRemoteRevokeFailure(error);
+}
+
+/**
+ * Concrete account ids still referenced by active local rows. When any row still
+ * only has the provider slug (or no ref), orphan cleanup must not run — a sibling
+ * may have created its remote account before persisting the concrete id.
+ */
+function concreteKeepAccountIds(
+  refs: Array<string | null | undefined>,
+  provider: string,
+): { keepIds: string[]; canRevokeUnreferenced: boolean } {
+  const keepIds: string[] = [];
+  let canRevokeUnreferenced = true;
+  for (const ref of refs) {
+    const value = ref?.trim();
+    if (!value || value === provider) {
+      canRevokeUnreferenced = false;
+      continue;
+    }
+    keepIds.push(value);
+  }
+  return { keepIds, canRevokeUnreferenced };
+}
+
+async function lockProviderConnectionScope(
+  tx: Prisma.TransactionClient,
+  owner: Pick<Actor, "spaceId" | "userId">,
+  connectorId: string,
+  provider: string,
+): Promise<void> {
+  // Avoid NUL separators in the lock key; text params may truncate at a zero byte and break begin.
+  const scope = `space:${owner.spaceId}|user:${owner.userId}|connector:${connectorId}|provider:${provider}`;
+  await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext('connection-provider'), hashtext(${scope}))`;
 }
 
 function computerContext(actor: Actor, botId: string, operationId: string): AdapterContext {
@@ -335,6 +419,7 @@ export interface RouterDeps {
   home: AgentHomeStore;
   secrets: EncryptedSecretStore;
   oauthLogins: PiOAuthLogins;
+  integrationSettings?: IntegrationProviderSettings;
   composio?: ComposioProvider;
   mcpOAuth?: McpOAuthBroker;
   connectors: ConnectorRegistry;
@@ -355,12 +440,14 @@ export interface RouterDeps {
     updaterUrl?: string;
     updaterToken?: string;
     imageTag?: string;
+    integrationsCatalogUrl?: string;
   };
 }
 
 export function createRouter(deps: RouterDeps) {
   const os = implement(appContract).$context<{ actor: Actor | null; signal?: AbortSignal }>();
   const repos = createRepos(deps.prisma);
+  const onboardingDeps = { prisma: deps.prisma, events: deps.events, connectors: deps.connectors };
   const mcpOAuth = deps.mcpOAuth ?? new McpOAuthBroker(deps.prisma, deps.secrets);
   const groupRepos = createGroupRepos(deps.prisma);
   const taughtSkills = createTaughtSkillsService({
@@ -412,10 +499,59 @@ export function createRouter(deps: RouterDeps) {
           id: space.id,
           name: space.name,
           isDefault: false,
+          hasContent: false,
           bots: [],
           groups: [],
+          externalConversations: [],
           botSections: [],
         };
+      }),
+      remove: authed.spaces.remove.handler(async ({ context, input }) => {
+        try {
+          const deleteInput = {
+            currentSpaceId: context.actor.spaceId,
+            userId: context.actor.userId,
+            spaceId: input.spaceId,
+          };
+          // Destroy leftover team sandboxes before cascading the Space row. Clear
+          // each providerRef only after that destroy succeeds so a failed destroy
+          // keeps the durable handle, and a later SpaceNotEmptyError cannot leave
+          // a row pointing at a sandbox that is already gone (same order as
+          // destroyBot: provider teardown, then drop the persisted handle).
+          const computers = await listDeletableSpaceComputers(deps.prisma, deleteInput);
+          const adapterContext = connectionContext(context.actor, "spaces.remove", context.signal);
+          for (const computer of computers) {
+            await deps.sandbox.destroy(toComputerRef(computer), {
+              ...adapterContext,
+              botId: computer.homeKey,
+            });
+            await deps.prisma.computer.updateMany({
+              where: {
+                spaceId: input.spaceId,
+                homeKey: computer.homeKey,
+                providerRef: computer.providerRef,
+              },
+              data: { state: "stopped", providerRef: null },
+            });
+          }
+          const fallback = await deleteEmptySpaceForMember(deps.prisma, deleteInput);
+          return { ok: true as const, activeSpaceId: fallback.id };
+        } catch (error) {
+          if (error instanceof SpaceNotFoundError) {
+            throw new ORPCError("NOT_FOUND", { message: error.message });
+          }
+          if (error instanceof CannotDeleteSpaceAsNonOwnerError) {
+            throw new ORPCError("FORBIDDEN", { message: error.message });
+          }
+          if (
+            error instanceof CannotDeleteDefaultSpaceError ||
+            error instanceof CannotDeleteLastSpaceError ||
+            error instanceof SpaceNotEmptyError
+          ) {
+            throw new ORPCError("BAD_REQUEST", { message: error.message });
+          }
+          throw error;
+        }
       }),
     },
     bootstrap: authed.bootstrap.handler(async ({ context, input }) => {
@@ -548,7 +684,23 @@ export function createRouter(deps: RouterDeps) {
       connect: authed.models.connect.handler(async ({ context, input }) => {
         let plaintext: string;
         try {
-          plaintext = buildModelConnectPlaintext(input);
+          let previousPlaintext: string | undefined;
+          if (input.provider === OPENAI_COMPATIBLE_PROVIDER_ID && input.apiKey === undefined) {
+            const credential = await findModelCredential(
+              deps.prisma,
+              context.actor,
+              input.provider,
+            );
+            if (credential) {
+              const secret = await deps.prisma.secret.findFirst({
+                where: { id: credential.secretId, userId: context.actor.userId, spaceId: null },
+                select: { ciphertext: true },
+              });
+              if (secret)
+                previousPlaintext = deps.secrets.load(secret.ciphertext, credential.secretId);
+            }
+          }
+          plaintext = buildModelConnectPlaintext(input, previousPlaintext);
         } catch (error) {
           throw new ORPCError("BAD_REQUEST", {
             message: error instanceof Error ? error.message : "Invalid model connection",
@@ -736,7 +888,32 @@ export function createRouter(deps: RouterDeps) {
             const entry = listPiCatalog().find(
               (item) => item.provider === effectiveProvider && item.id === effectiveModelId,
             );
-            const allowed = entry?.thinkingLevels;
+            let allowed = entry?.thinkingLevels;
+            if (effectiveProvider === OPENAI_COMPATIBLE_PROVIDER_ID) {
+              allowed = ["off"];
+              const credential = await findModelCredential(
+                deps.prisma,
+                context.actor,
+                effectiveProvider,
+              );
+              if (credential && credential.defaultModel === effectiveModelId) {
+                const secret = await deps.prisma.secret.findFirst({
+                  where: { id: credential.secretId, userId: context.actor.userId, spaceId: null },
+                  select: { ciphertext: true },
+                });
+                if (secret) {
+                  try {
+                    allowed =
+                      modelCredentialDto(
+                        credential,
+                        deps.secrets.load(secret.ciphertext, credential.secretId),
+                      ).thinkingLevels ?? allowed;
+                  } catch {
+                    // Unreadable connections must not advertise reasoning support.
+                  }
+                }
+              }
+            }
             if (allowed && !allowed.includes(input.thinkingLevel)) {
               throw new ORPCError("BAD_REQUEST", {
                 message: `Thinking level must be one of: ${allowed.join(", ")}`,
@@ -744,8 +921,14 @@ export function createRouter(deps: RouterDeps) {
             }
           }
         }
-        await deps.prisma.bot.update({
-          where: { id: input.botId },
+        if (!existing.thread) throw new IsolationError();
+        await commitBotUpdate({
+          prisma: deps.prisma,
+          notify: (threadId, seq) => deps.events.notify(threadId, seq),
+          spaceId: context.actor.spaceId,
+          threadId: existing.thread.id,
+          botId: input.botId,
+          emitBotUpdated: botProfileLabelsChanged(input),
           data: {
             name: input.name,
             title: input.title,
@@ -762,6 +945,10 @@ export function createRouter(deps: RouterDeps) {
               ? { modelProvider: input.modelProvider, modelId: input.modelId ?? null }
               : {}),
             ...(input.thinkingLevel !== undefined ? { thinkingLevel } : {}),
+            ...(input.teamChatAmbientEnabled !== undefined
+              ? { teamChatAmbientEnabled: input.teamChatAmbientEnabled }
+              : {}),
+            ...(input.teamChatRules !== undefined ? { teamChatRules: input.teamChatRules } : {}),
           },
         });
         const bots = await repos.listBots(context.actor);
@@ -776,9 +963,12 @@ export function createRouter(deps: RouterDeps) {
         if (currentMode === input.mode) {
           return repos.setBotComputer(context.actor, bot.id, input.mode);
         }
-        const claimed = await deps.prisma.bot.updateMany({
-          where: { id: bot.id, computerSwitching: false },
-          data: { computerSwitching: true },
+        const claimed = await deps.prisma.$transaction(async (tx) => {
+          await tx.$queryRaw`SELECT id FROM computers WHERE id = ${bot.computerId} FOR UPDATE`;
+          return tx.bot.updateMany({
+            where: { id: bot.id, computerSwitching: false, computer: { maintenanceId: null } },
+            data: { computerSwitching: true },
+          });
         });
         if (claimed.count !== 1) throw new ORPCError("CONFLICT");
         try {
@@ -1060,25 +1250,7 @@ export function createRouter(deps: RouterDeps) {
           context.signal,
         )) {
           if (await isPeerRun(deps.prisma, event.runId, peerRunCache)) {
-            // Keep terminal peer-run events so clients can clear working state.
-            // Keep compact peer receipts for mobile; drop peer activity/replies.
-            const isTerminal =
-              event.type === "run.completed" ||
-              event.type === "run.failed" ||
-              event.type === "run.cancelled";
-            const blocks = event.payload.blocks;
-            const isReceipt =
-              (event.type === "thread.message.created" ||
-                event.type === "thread.message.updated") &&
-              Array.isArray(blocks) &&
-              blocks.some(
-                (block) =>
-                  !!block &&
-                  typeof block === "object" &&
-                  "kind" in block &&
-                  (block.kind === "bot_message_received" || block.kind === "bot_message_sent"),
-              );
-            if (!isTerminal && !isReceipt) continue;
+            if (!shouldForwardPeerThreadEvent(event)) continue;
           }
           yield event;
         }
@@ -1095,21 +1267,10 @@ export function createRouter(deps: RouterDeps) {
       }),
       react: authed.threads.react.handler(async ({ context, input }) => {
         const target = await resolveThreadTarget(deps.prisma, context.actor, input);
-        const result = await reactToThreadMessage(
-          deps,
-          context.actor,
-          target,
-          input.messageId,
-          input.thumbsUp,
-        );
+        const result = await reactToThreadMessage(deps, context.actor, target, input);
         if (result.eventSeq != null) {
           await deps.events.notify(target.threadId, result.eventSeq).catch((error) => {
             getLogger().error("thread reaction realtime notification", error);
-          });
-        }
-        if (result.runId) {
-          await deps.jobs.enqueue(runContinueJob(result.runId)).catch((error) => {
-            getLogger().error("thread reaction enqueue", error);
           });
         }
         return { ok: true as const };
@@ -1336,6 +1497,11 @@ export function createRouter(deps: RouterDeps) {
             screenLeaseId: screenLeaseIdForRun(lease, manualRunId),
           });
           scheduleComputerSleep(deps.jobs, bot.computer.id);
+        } catch (error) {
+          if (error instanceof ComputerBusyError) {
+            throw new ORPCError("CONFLICT", { message: "Computer is busy" });
+          }
+          throw error;
         } finally {
           await releaseComputerExecutionLease(deps.prisma, lease);
         }
@@ -1350,6 +1516,7 @@ export function createRouter(deps: RouterDeps) {
           where: {
             id: bot.computer.id,
             state: { not: "suspending" },
+            maintenanceId: null,
             executionLeases: {
               none: { botId: { not: bot.id }, expiresAt: { gt: now } },
             },
@@ -1413,21 +1580,115 @@ export function createRouter(deps: RouterDeps) {
         );
         return computerStatus(deps, context.actor, input.botId);
       }),
-      recover: authed.computer.recover.handler(async ({ context, input }) =>
-        runComputerReplace(deps, context, input.botId, "recover", "recover"),
-      ),
+      recover: authed.computer.recover.handler(async ({ context, input }) => {
+        const bot = await repos.getBot(context.actor, input.botId);
+        if (!bot.computer) throw new IsolationError();
+        try {
+          return await queueComputerUpdate(deps, bot.computer.id, bot.id, "recover");
+        } catch (error) {
+          if (error instanceof ComputerBusyError)
+            throw new ORPCError("CONFLICT", { message: "Computer is busy" });
+          throw error;
+        }
+      }),
       reset: authed.computer.reset.handler(async ({ context, input }) =>
         runComputerReplace(deps, context, input.botId, "reset", "reset"),
       ),
-      update: authed.computer.update.handler(async ({ context, input }) =>
-        runComputerReplace(deps, context, input.botId, "update", "update"),
-      ),
+      update: authed.computer.update.handler(async ({ context, input }) => {
+        const bot = await repos.getBot(context.actor, input.botId);
+        if (!bot.computer) throw new IsolationError();
+        if (!computerSupportsUpdate(bot.computer.kind))
+          throw new ORPCError("BAD_REQUEST", {
+            message: "Computer update is not available on this device",
+          });
+        try {
+          return await queueComputerUpdate(deps, bot.computer.id, bot.id);
+        } catch (error) {
+          if (error instanceof ComputerBusyError)
+            throw new ORPCError("CONFLICT", { message: "Computer is busy" });
+          throw error;
+        }
+      }),
+      updates: authed.computer.updates.handler(async ({ context }) => {
+        const rows = await deps.prisma.computerUpdate.findMany({
+          where: {
+            status: { in: ["queued", "running", "interrupted", "failed"] },
+            computer: {
+              spaceId: context.actor.spaceId,
+              bots: { some: { userId: context.actor.userId, archivedAt: null } },
+            },
+          },
+          include: {
+            computer: {
+              include: {
+                bots: {
+                  where: { userId: context.actor.userId, archivedAt: null },
+                  select: { id: true, name: true },
+                },
+              },
+            },
+          },
+          orderBy: { createdAt: "desc" },
+        });
+        return rows.map((row) => computerUpdateView(row, context.actor.isDeploymentOwner));
+      }),
+      releaseInterrupted: authed.computer.releaseInterrupted.handler(async ({ context, input }) => {
+        if (!context.actor.isDeploymentOwner) throw new ORPCError("FORBIDDEN");
+        // This is an attended lock release, never a heartbeat-based takeover.
+        // The contract requires the operator's explicit workersStopped assertion.
+        await deps.prisma.$transaction(async (tx) => {
+          const update = await tx.computerUpdate.findFirst({
+            where: {
+              id: input.id,
+              status: "interrupted",
+              computer: {
+                spaceId: context.actor.spaceId,
+                bots: { some: { userId: context.actor.userId, archivedAt: null } },
+              },
+            },
+          });
+          if (!update) throw new ORPCError("CONFLICT");
+          const failed = await tx.computerUpdate.updateMany({
+            where: { id: update.id, status: "interrupted" },
+            data: { status: "failed" },
+          });
+          if (failed.count !== 1) throw new ORPCError("CONFLICT");
+          const released = await tx.computer.updateMany({
+            where: { id: update.computerId, maintenanceId: update.id },
+            data: { maintenanceId: null, state: "error" },
+          });
+          if (released.count !== 1) throw new ORPCError("CONFLICT");
+        });
+        return { ok: true as const };
+      }),
+      dismissUpdate: authed.computer.dismissUpdate.handler(async ({ context, input }) => {
+        await deps.prisma.computerUpdate.updateMany({
+          where: {
+            id: input.id,
+            status: "failed",
+            computer: {
+              spaceId: context.actor.spaceId,
+              bots: { some: { userId: context.actor.userId, archivedAt: null } },
+            },
+          },
+          data: { status: "dismissed" },
+        });
+        return { ok: true as const };
+      }),
       takeover: authed.computer.takeover.handler(async ({ context, input }) => {
         let bot = await repos.getBot(context.actor, input.botId);
         if (!bot.computer?.providerRef || bot.computer.state !== "running") {
           throw new ORPCError("BAD_REQUEST", { message: "computer must be running" });
         }
         if (hasActiveComputerControl(bot.computer) && bot.computer.controlBotId === bot.id) {
+          await bindWaitingTakeoverToControl(deps, {
+            spaceId: context.actor.spaceId,
+            threadId: bot.thread?.id,
+            botId: bot.id,
+            computerId: bot.computer.id,
+            controlLeaseId: bot.computer.controlLeaseId!,
+            controlRunId: bot.computer.controlRunId,
+          });
           await scheduleComputerControlExpiry(
             deps.jobs,
             bot.computer.id,
@@ -1495,6 +1756,7 @@ export function createRouter(deps: RouterDeps) {
           where: {
             id: bot.computer.id,
             state: "running",
+            maintenanceId: null,
             controlHolder: { not: "user" },
             controlLeaseId: null,
           },
@@ -1511,7 +1773,17 @@ export function createRouter(deps: RouterDeps) {
           const current = await deps.prisma.computer.findUniqueOrThrow({
             where: { id: bot.computer.id },
           });
-          if (!hasActiveComputerControl(current)) throw new ORPCError("CONFLICT");
+          if (!hasActiveComputerControl(current) || current.controlBotId !== bot.id) {
+            throw new ORPCError("CONFLICT", { message: "Computer control changed; try again" });
+          }
+          await bindWaitingTakeoverToControl(deps, {
+            spaceId: context.actor.spaceId,
+            threadId: bot.thread?.id,
+            botId: bot.id,
+            computerId: current.id,
+            controlLeaseId: current.controlLeaseId!,
+            controlRunId: current.controlRunId,
+          });
           await scheduleComputerControlExpiry(
             deps.jobs,
             current.id,
@@ -1856,21 +2128,9 @@ export function createRouter(deps: RouterDeps) {
       setDefaultScope: authed.memory.setDefaultScope.handler(async ({ context, input }) =>
         updateMemoryProviderDefaultScope(deps, context.actor, input.defaultMemoryScope),
       ),
-      disconnectProvider: authed.memory.disconnectProvider.handler(async ({ context }) => {
-        await requireSpaceOwner(deps.prisma, context.actor);
-        await withSerializableRetry(() =>
-          deps.prisma.$transaction(
-            async (tx) => {
-              const existing = await findSpaceMemoryConfig(tx, context.actor.spaceId);
-              if (!existing) return;
-              await tx.spaceMemoryConfig.delete({ where: { id: existing.id } });
-              await tx.secret.deleteMany({ where: { id: existing.secretId } });
-            },
-            { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
-          ),
-        );
-        return { ok: true as const };
-      }),
+      disconnectProvider: authed.memory.disconnectProvider.handler(async ({ context }) =>
+        disconnectMemoryProvider(deps, context.actor),
+      ),
     },
     routines: {
       list: authed.routines.list.handler(async ({ context, input }) => {
@@ -1907,6 +2167,8 @@ export function createRouter(deps: RouterDeps) {
             notify: input.notify,
             active: input.active,
             webhookEnabled: input.webhookEnabled,
+            githubEnabled: input.githubEnabled,
+            messageProvider: input.messageProvider,
             nextRunAt,
           },
         });
@@ -1937,9 +2199,12 @@ export function createRouter(deps: RouterDeps) {
         const crons = input.crons ?? existing.crons;
         const timezone = input.timezone ?? existing.timezone;
         const webhookEnabled = input.webhookEnabled ?? existing.webhookEnabled;
-        if (crons.length === 0 && !webhookEnabled) {
+        const githubEnabled = input.githubEnabled ?? existing.githubEnabled;
+        const messageProvider =
+          input.messageProvider === undefined ? existing.messageProvider : input.messageProvider;
+        if (crons.length === 0 && !webhookEnabled && !githubEnabled && !messageProvider) {
           throw new ORPCError("BAD_REQUEST", {
-            message: "Add a schedule or webhook trigger",
+            message: "Add a schedule, webhook, GitHub, or message trigger",
           });
         }
         if (hasMixedOneShotSchedule(crons)) {
@@ -2006,6 +2271,8 @@ export function createRouter(deps: RouterDeps) {
             active: input.active,
             notify: input.notify,
             webhookEnabled: input.webhookEnabled,
+            githubEnabled: input.githubEnabled,
+            messageProvider: input.messageProvider,
             nextRunAt,
           },
         });
@@ -2248,6 +2515,25 @@ export function createRouter(deps: RouterDeps) {
           createdAt: row.createdAt.toISOString(),
         }));
       }),
+      catalogSearch: authed.capabilities.catalogSearch.handler(async ({ context, input }) => {
+        const baseUrl =
+          deps.env.integrationsCatalogUrl ??
+          (input.usePublicCatalog ? "https://integrations.sh" : undefined);
+        if (!baseUrl) return { enabled: false, results: [] };
+        try {
+          const results = await searchIntegrationCatalog({
+            baseUrl,
+            query: input.query,
+            signal: context.signal ?? new AbortController().signal,
+            fetch: deps.remoteConnectors?.fetch,
+          });
+          return { enabled: true, results };
+        } catch (error) {
+          throw new ORPCError("BAD_GATEWAY", {
+            message: error instanceof Error ? error.message : "Integration catalog search failed",
+          });
+        }
+      }),
       install: authed.capabilities.install.handler(async ({ context, input }) => {
         let source = input.source.trim();
         let config = input.config;
@@ -2264,9 +2550,14 @@ export function createRouter(deps: RouterDeps) {
         if (JSON.stringify(config).length > 2_000_000) {
           throw new ORPCError("BAD_REQUEST", { message: "Capability configuration is too large" });
         }
-        if (credential && input.kind !== "mcp" && input.kind !== "api") {
+        if (
+          credential &&
+          input.kind !== "mcp" &&
+          input.kind !== "api" &&
+          input.kind !== "graphql"
+        ) {
           throw new ORPCError("BAD_REQUEST", {
-            message: "Credentials are only accepted for MCP and API tool sources",
+            message: "Credentials are only accepted for MCP, API, and GraphQL tool sources",
           });
         }
         try {
@@ -2286,6 +2577,17 @@ export function createRouter(deps: RouterDeps) {
           }
           if (input.kind === "api") {
             const prepared = await prepareApiInstall({
+              source,
+              config,
+              credential,
+              signal: context.signal,
+              remote: deps.remoteConnectors,
+            });
+            source = prepared.source;
+            config = prepared.config;
+          }
+          if (input.kind === "graphql") {
+            const prepared = await prepareGraphqlInstall({
               source,
               config,
               credential,
@@ -2454,7 +2756,6 @@ export function createRouter(deps: RouterDeps) {
           return mcpServerDto(row, await mcpOAuth.statusFor(row, context.actor));
         }),
         update: authed.mcp.servers.update.handler(async ({ context, input }) => {
-          const config = input.config;
           const row = await deps.prisma.$transaction(async (tx) => {
             // Share the OAuth broker's per-server lock so a stale authorization
             // snapshot cannot overwrite a simultaneous credential edit.
@@ -2488,6 +2789,22 @@ export function createRouter(deps: RouterDeps) {
                 /* Existing malformed secrets are replaced only when new credentials are supplied. */
               }
             }
+            const config =
+              "config" in input
+                ? input.config
+                : {
+                    slug: existing.slug,
+                    name: existing.name,
+                    description: existing.description,
+                    enabled: existing.enabled,
+                    transport: existing.transport as "streamable_http" | "sse",
+                    endpoint: existing.endpoint!,
+                    headers: (existingMaterial.headers ?? {}) as Record<string, string>,
+                    secret: input.secret,
+                  };
+            if (!("config" in input) && existing.transport === "stdio") {
+              throw new ORPCError("BAD_REQUEST", { message: "A remote MCP server is required" });
+            }
             const nextEndpoint = "endpoint" in config ? config.endpoint : null;
             const update = buildMcpUpdateMaterial(existingMaterial, config, {
               clearOAuth: existing.endpoint !== nextEndpoint,
@@ -2500,6 +2817,17 @@ export function createRouter(deps: RouterDeps) {
                   )
                 : null;
             const clearing = update.action === "store" && Object.keys(update.material).length === 0;
+            if (stored) {
+              await tx.secret.create({
+                data: {
+                  id: stored.id,
+                  userId: context.actor.userId,
+                  spaceId: context.actor.spaceId,
+                  kind: "mcp",
+                  ciphertext: stored.ciphertext,
+                },
+              });
+            }
             const updated = await tx.mcpServer.update({
               where: { id: existing.id },
               data: {
@@ -2522,15 +2850,6 @@ export function createRouter(deps: RouterDeps) {
               },
             });
             if (stored) {
-              await tx.secret.create({
-                data: {
-                  id: stored.id,
-                  userId: context.actor.userId,
-                  spaceId: context.actor.spaceId,
-                  kind: "mcp",
-                  ciphertext: stored.ciphertext,
-                },
-              });
               if (existing.secretId)
                 await tx.secret.deleteMany({
                   where: {
@@ -2743,45 +3062,65 @@ export function createRouter(deps: RouterDeps) {
     },
     onboarding: {
       start: authed.onboarding.start.handler(async ({ context, input }) => {
-        await startOnboarding(
-          { prisma: deps.prisma, events: deps.events, composio: deps.composio },
-          context.actor,
-          input.botId,
-        );
+        await startOnboarding(onboardingDeps, context.actor, input.botId);
         return { ok: true as const };
       }),
       promptFocus: authed.onboarding.promptFocus.handler(async ({ context, input }) => {
-        await promptFocus(
-          { prisma: deps.prisma, events: deps.events, composio: deps.composio },
-          context.actor,
-          input.botId,
-        );
+        await promptFocus(onboardingDeps, context.actor, input.botId);
         return { ok: true as const };
       }),
       choose: authed.onboarding.choose.handler(async ({ context, input }) => {
-        await chooseFocus(
-          { prisma: deps.prisma, events: deps.events, composio: deps.composio },
-          context.actor,
-          input.botId,
-          input.optionId,
-        );
+        await chooseFocus(onboardingDeps, context.actor, input.botId, input.optionId);
         return { ok: true as const };
       }),
       dismissFocus: authed.onboarding.dismissFocus.handler(async ({ context, input }) => {
-        await dismissFocus(
-          { prisma: deps.prisma, events: deps.events, composio: deps.composio },
-          context.actor,
-          input.botId,
-        );
+        await dismissFocus(onboardingDeps, context.actor, input.botId);
         return { ok: true as const };
       }),
       appConnected: authed.onboarding.appConnected.handler(async ({ context, input }) => {
         await markAppConnected(
-          { prisma: deps.prisma, events: deps.events, composio: deps.composio },
+          onboardingDeps,
           context.actor,
           input.botId,
           input.provider,
+          input.connectorId,
         );
+        return { ok: true as const };
+      }),
+    },
+    integrationSetup: {
+      get: authed.integrationSetup.get.handler(async ({ context }) => {
+        const canConfigure = context.actor.isDeploymentOwner;
+        const providers = canConfigure
+          ? await Promise.all(
+              IntegrationProviderIdSchema.options.map(async (id) => ({
+                id,
+                configured: deps.integrationSettings
+                  ? await deps.integrationSettings.configured(id)
+                  : Boolean(deps.connectors.managed(id)),
+              })),
+            )
+          : [];
+        return {
+          canConfigure,
+          needsSetup: canConfigure && !providers.some((provider) => provider.configured),
+          webUrl: new URL("/integrations/setup", deps.env.webOrigin).toString(),
+          providers,
+        };
+      }),
+      save: authed.integrationSetup.save.handler(async ({ context, input }) => {
+        if (!context.actor.isDeploymentOwner) throw new ORPCError("FORBIDDEN");
+        if (!deps.integrationSettings) throw new ORPCError("NOT_IMPLEMENTED");
+        try {
+          await deps.integrationSettings.save(
+            input,
+            connectionContext(context.actor, "integrationSetup.save", context.signal),
+          );
+        } catch {
+          throw new ORPCError("BAD_REQUEST", {
+            message: "Could not verify or save these credentials",
+          });
+        }
         return { ok: true as const };
       }),
     },
@@ -2838,39 +3177,174 @@ export function createRouter(deps: RouterDeps) {
         }));
       }),
       begin: authed.connections.begin.handler(async ({ context, input }) => {
-        const connector = deps.connectors.managed(input.connectorId);
+        const connector =
+          deps.integrationSettings &&
+          (input.connectorId === "composio" || input.connectorId === "pipedream")
+            ? await deps.integrationSettings.resolve(input.connectorId)
+            : deps.connectors.managed(input.connectorId);
         if (!connector) {
           throw new ORPCError("BAD_REQUEST", {
             message: `Connector ${input.connectorId} is not configured`,
           });
         }
-        const row = await deps.prisma.connection.create({
-          data: {
-            spaceId: context.actor.spaceId,
-            userId: context.actor.userId,
-            connectorId: input.connectorId,
-            provider: input.provider,
-            displayName: input.displayName,
-            status: "pending",
-          },
+        // Share the revoke scope lock so a slug-wide remote delete cannot miss a
+        // row that is inserted after SELECT FOR UPDATE and before remote revoke.
+        const row = await deps.prisma.$transaction(async (tx) => {
+          await lockProviderConnectionScope(tx, context.actor, input.connectorId, input.provider);
+          return tx.connection.create({
+            data: {
+              spaceId: context.actor.spaceId,
+              userId: context.actor.userId,
+              connectorId: input.connectorId,
+              provider: input.provider,
+              displayName: input.displayName,
+              status: "pending",
+            },
+          });
         });
         try {
           const auth = await connector.begin(
             { provider: input.provider, redirectUrl: `${deps.env.webOrigin}/app` },
             connectionContext(context.actor, "connections.begin", context.signal),
           );
-          await deps.prisma.connection.update({
-            where: { id: row.id },
-            data: {
-              status: auth.authorizationUrl ? "pending" : "connected",
-              providerRef: auth.state || null,
-              metadata: { state: auth.state },
-            },
+          // Re-take the provider lock and only advance still-pending rows so a
+          // concurrent revoke cannot be overwritten back to pending/connected.
+          const applied = await deps.prisma.$transaction(async (tx) => {
+            await lockProviderConnectionScope(tx, context.actor, input.connectorId, input.provider);
+            const updated = await tx.connection.updateMany({
+              where: {
+                id: row.id,
+                spaceId: context.actor.spaceId,
+                userId: context.actor.userId,
+                status: "pending",
+              },
+              data: {
+                status: auth.authorizationUrl ? "pending" : "connected",
+                providerRef: auth.state || null,
+                metadata: { state: auth.state },
+              },
+            });
+            return updated.count > 0;
           });
+          if (!applied) {
+            // Revoke won the race. Clean up without a provider-wide slug delete.
+            const state = auth.state?.trim();
+            const adapterContext = connectionContext(
+              context.actor,
+              "connections.begin",
+              context.signal,
+            );
+            if (state && state !== input.provider) {
+              // Composio browser OAuth stores an authorization-request id in
+              // auth.state. Prefer canceling that pending request by id so the
+              // authorization URL cannot later create an untracked remote. The
+              // request id is the connected-account nanoid (INITIATED until OAuth
+              // finishes). Fall back to resolving an ACTIVE account id only when
+              // cancel is unavailable.
+              const cancelAuthorizationRequest = (
+                connector as {
+                  cancelAuthorizationRequest?: (
+                    requestId: string,
+                    context: typeof adapterContext,
+                  ) => Promise<void>;
+                }
+              ).cancelAuthorizationRequest;
+              if (cancelAuthorizationRequest) {
+                await cancelAuthorizationRequest(state, adapterContext).catch(() => undefined);
+              } else {
+                const resolveAccountId = (
+                  connector as {
+                    resolveConnectedAccountId?: (
+                      userId: string,
+                      slug: string,
+                      currentRef: string | null | undefined,
+                      excludeIds?: string[],
+                      spaceId?: string,
+                    ) => Promise<string | undefined>;
+                  }
+                ).resolveConnectedAccountId;
+                let revokeRef = state;
+                if (resolveAccountId) {
+                  const resolved = await resolveAccountId(
+                    context.actor.userId,
+                    input.provider,
+                    state,
+                    [],
+                    context.actor.spaceId,
+                  ).catch(() => undefined);
+                  if (!resolved) {
+                    revokeRef = "";
+                  } else {
+                    revokeRef = resolved;
+                  }
+                }
+                if (revokeRef) {
+                  await connector.revoke(revokeRef, adapterContext).catch(() => undefined);
+                }
+              }
+            } else if (state === input.provider) {
+              // Pipedream begin only returns the app slug. Drop remotes that no
+              // remaining local row still references so a lost race cannot leave
+              // an orphan authorization, without wiping sibling accounts.
+              const revokeUnreferenced = (
+                connector as {
+                  revokeUnreferencedAccounts?: (
+                    slug: string,
+                    keepAccountIds: string[],
+                    context: ReturnType<typeof connectionContext>,
+                  ) => Promise<void>;
+                }
+              ).revokeUnreferencedAccounts;
+              if (revokeUnreferenced) {
+                // Hold the provider lock across the keep-id snapshot and remote
+                // cleanup so a concurrent complete cannot persist a providerRef
+                // that this cleanup then deletes as unreferenced.
+                await deps.prisma
+                  .$transaction(
+                    async (tx) => {
+                      await lockProviderConnectionScope(
+                        tx,
+                        context.actor,
+                        input.connectorId,
+                        input.provider,
+                      );
+                      const kept = await tx.connection.findMany({
+                        where: {
+                          spaceId: context.actor.spaceId,
+                          userId: context.actor.userId,
+                          connectorId: input.connectorId,
+                          provider: input.provider,
+                          status: { in: ["connected", "pending", "error"] },
+                        },
+                        select: { providerRef: true },
+                      });
+                      const { keepIds, canRevokeUnreferenced } = concreteKeepAccountIds(
+                        kept.map((entry) => entry.providerRef),
+                        input.provider,
+                      );
+                      // Skip while any sibling still lacks a concrete account id —
+                      // otherwise slug-only pending refs are dropped from keepIds and
+                      // revokeUnreferencedAccounts deletes that sibling's remote auth.
+                      if (!canRevokeUnreferenced) return;
+                      await revokeUnreferenced(input.provider, keepIds, adapterContext);
+                    },
+                    { timeout: 60_000 },
+                  )
+                  .catch(() => undefined);
+              }
+            }
+            throw new IsolationError();
+          }
           return { connectionId: row.id, authorizationUrl: auth.authorizationUrl };
         } catch (error) {
-          await deps.prisma.connection.update({
-            where: { id: row.id },
+          if (error instanceof IsolationError) throw error;
+          await deps.prisma.connection.updateMany({
+            where: {
+              id: row.id,
+              spaceId: context.actor.spaceId,
+              userId: context.actor.userId,
+              status: "pending",
+            },
             data: { status: "error" },
           });
           throw new ORPCError("BAD_REQUEST", { message: sanitizeComposioError(error) });
@@ -2893,27 +3367,279 @@ export function createRouter(deps: RouterDeps) {
         }
         let row = existing;
         if (existing.status !== "connected") {
-          if (input.code) {
-            const state = existing.providerRef ?? existing.provider;
-            try {
-              await connector.complete(
-                { state, code: input.code },
-                connectionContext(context.actor, "connections.complete", context.signal),
+          // Hold the provider lock across remote completion, account-id resolution,
+          // providerRef persistence, and any overlapping revokeUnreferenced cleanup
+          // so a concurrent begin-loss cleanup cannot delete the account we are about
+          // to persist.
+          row = await deps.prisma.$transaction(
+            async (tx) => {
+              await lockProviderConnectionScope(
+                tx,
+                context.actor,
+                existing.connectorId,
+                existing.provider,
               );
-            } catch (error) {
-              throw new ORPCError("BAD_REQUEST", { message: sanitizeComposioError(error) });
-            }
-          }
-          const ready = await connector.connectionReady(
-            connectionContext(context.actor, "connections.complete", context.signal),
-            existing.provider,
+              const current = await tx.connection.findFirst({
+                where: {
+                  id: existing.id,
+                  spaceId: context.actor.spaceId,
+                  userId: context.actor.userId,
+                },
+              });
+              if (!current) throw new IsolationError();
+              if (current.status === "connected") return current;
+              if (current.status === "revoked") {
+                // Authorization URLs from a revoke-win begin can still finish
+                // remotely. Cancel leftover Composio request ids / drop Pipedream
+                // remotes no active local row still references before rejecting.
+                const revokedContext = connectionContext(
+                  context.actor,
+                  "connections.complete",
+                  context.signal,
+                );
+                const restoreRevokedForRetry = async () => {
+                  // Cleanup failed while the row is already revoked — restore pending
+                  // so the UI can retry removal instead of leaving an orphan remote.
+                  // Use the root client (not tx): throwing IsolationError aborts this
+                  // transaction and would otherwise roll back a tx-scoped restore.
+                  await deps.prisma.connection.updateMany({
+                    where: {
+                      id: current.id,
+                      spaceId: context.actor.spaceId,
+                      userId: context.actor.userId,
+                      status: "revoked",
+                    },
+                    data: { status: "pending" },
+                  });
+                };
+                const pendingRef = current.providerRef?.trim();
+                try {
+                  if (pendingRef && pendingRef !== current.provider) {
+                    const cancelAuthorizationRequest = (
+                      connector as {
+                        cancelAuthorizationRequest?: (
+                          requestId: string,
+                          context: typeof revokedContext,
+                        ) => Promise<void>;
+                      }
+                    ).cancelAuthorizationRequest;
+                    if (cancelAuthorizationRequest) {
+                      await cancelAuthorizationRequest(pendingRef, revokedContext);
+                    } else {
+                      const resolveAccountId = (
+                        connector as {
+                          resolveConnectedAccountId?: (
+                            userId: string,
+                            slug: string,
+                            currentRef: string | null | undefined,
+                            excludeIds?: string[],
+                            spaceId?: string,
+                          ) => Promise<string | undefined>;
+                        }
+                      ).resolveConnectedAccountId;
+                      let revokeRef = pendingRef;
+                      if (resolveAccountId) {
+                        const resolved = await resolveAccountId(
+                          context.actor.userId,
+                          current.provider,
+                          pendingRef,
+                          [],
+                          context.actor.spaceId,
+                        ).catch(() => undefined);
+                        revokeRef = resolved ?? "";
+                      }
+                      if (revokeRef) {
+                        await connector.revoke(revokeRef, revokedContext);
+                      }
+                    }
+                  } else {
+                    const revokeUnreferenced = (
+                      connector as {
+                        revokeUnreferencedAccounts?: (
+                          slug: string,
+                          keepAccountIds: string[],
+                          context: typeof revokedContext,
+                        ) => Promise<void>;
+                      }
+                    ).revokeUnreferencedAccounts;
+                    if (revokeUnreferenced) {
+                      const kept = await tx.connection.findMany({
+                        where: {
+                          spaceId: context.actor.spaceId,
+                          userId: context.actor.userId,
+                          connectorId: existing.connectorId,
+                          provider: existing.provider,
+                          status: { in: ["connected", "pending", "error"] },
+                        },
+                        select: { providerRef: true },
+                      });
+                      const { keepIds, canRevokeUnreferenced } = concreteKeepAccountIds(
+                        kept.map((entry) => entry.providerRef),
+                        existing.provider,
+                      );
+                      if (canRevokeUnreferenced) {
+                        await revokeUnreferenced(existing.provider, keepIds, revokedContext);
+                      }
+                    }
+                  }
+                } catch (error) {
+                  getLogger().error(
+                    "connections.complete remote cleanup failed for revoked row",
+                    error,
+                    {
+                      connectionId: current.id,
+                      connectorId: existing.connectorId,
+                      provider: existing.provider,
+                    },
+                  );
+                  await restoreRevokedForRetry();
+                }
+                throw new IsolationError();
+              }
+
+              const adapterContext = connectionContext(
+                context.actor,
+                "connections.complete",
+                context.signal,
+              );
+              if (input.code) {
+                const state = current.providerRef ?? current.provider;
+                try {
+                  await connector.complete({ state, code: input.code }, adapterContext);
+                } catch (error) {
+                  throw new ORPCError("BAD_REQUEST", { message: sanitizeComposioError(error) });
+                }
+              }
+              const ready = await connector.connectionReady(adapterContext, current.provider);
+              if (!ready) return current;
+
+              // Browser OAuth stores a connection-request id in providerRef from
+              // begin. Resolve it to the connected-account id so revoke deletes the
+              // right remote authorization. Prefer an account id not already used
+              // by a sibling row for the same provider.
+              const resolveAccountId = (
+                connector as {
+                  resolveConnectedAccountId?: (
+                    userId: string,
+                    slug: string,
+                    currentRef: string | null | undefined,
+                    excludeIds?: string[],
+                    spaceId?: string,
+                  ) => Promise<string | undefined>;
+                  connectedAccountId?: (
+                    userId: string,
+                    slug: string,
+                  ) => Promise<string | undefined>;
+                }
+              ).resolveConnectedAccountId;
+              const fallbackAccountId = (
+                connector as {
+                  connectedAccountId?: (
+                    userId: string,
+                    slug: string,
+                  ) => Promise<string | undefined>;
+                }
+              ).connectedAccountId;
+              let resolvedAccountId: string | undefined;
+              if (resolveAccountId || fallbackAccountId) {
+                const siblings = await tx.connection.findMany({
+                  where: {
+                    spaceId: context.actor.spaceId,
+                    userId: context.actor.userId,
+                    connectorId: existing.connectorId,
+                    provider: existing.provider,
+                    id: { not: existing.id },
+                    status: { in: ["connected", "pending", "error"] },
+                  },
+                  select: { providerRef: true },
+                });
+                // Exclude concrete account ids only. A pending sibling may still
+                // store a slug or authorization-request id; passing those raw refs
+                // would not match remote account ids and can let this row adopt the
+                // sibling's account. If a sibling ref cannot be resolved yet, leave
+                // this row pending so a later complete can re-resolve safely.
+                const excludeIds: string[] = [];
+                let unresolvedSibling = false;
+                for (const sibling of siblings) {
+                  const ref = sibling.providerRef?.trim();
+                  // Slug-only refs cannot identify a concrete remote account; resolving
+                  // them would pick an arbitrary ACTIVE id and over-exclude.
+                  if (!ref || ref === existing.provider) continue;
+                  if (resolveAccountId) {
+                    const resolvedSiblingId = await resolveAccountId(
+                      context.actor.userId,
+                      existing.provider,
+                      ref,
+                      [],
+                      context.actor.spaceId,
+                    ).catch(() => undefined);
+                    if (resolvedSiblingId) {
+                      excludeIds.push(resolvedSiblingId);
+                    } else {
+                      unresolvedSibling = true;
+                    }
+                  } else {
+                    excludeIds.push(ref);
+                  }
+                }
+                if (unresolvedSibling) {
+                  return current;
+                }
+                resolvedAccountId = resolveAccountId
+                  ? await resolveAccountId(
+                      context.actor.userId,
+                      existing.provider,
+                      current.providerRef,
+                      excludeIds,
+                      context.actor.spaceId,
+                    ).catch(() => undefined)
+                  : await fallbackAccountId!(context.actor.userId, existing.provider).catch(
+                      () => undefined,
+                    );
+              }
+
+              // When a resolver exists and providerRef is still a request-scoped
+              // id (not the provider slug), require a concrete account id before
+              // marking connected — otherwise revoke would delete the wrong ref.
+              if (
+                resolveAccountId &&
+                current.providerRef &&
+                current.providerRef !== current.provider &&
+                !resolvedAccountId
+              ) {
+                return current;
+              }
+
+              const providerRef = resolvedAccountId ?? current.providerRef;
+              if (providerRef) {
+                const taken = await tx.connection.findFirst({
+                  where: {
+                    spaceId: context.actor.spaceId,
+                    userId: context.actor.userId,
+                    connectorId: existing.connectorId,
+                    provider: existing.provider,
+                    id: { not: existing.id },
+                    status: { in: ["connected", "pending", "error"] },
+                    providerRef,
+                  },
+                  select: { id: true },
+                });
+                if (taken) {
+                  // Do not mark connected with a request-scoped or shared ref —
+                  // leave pending so a later complete can re-resolve an unused id.
+                  return current;
+                }
+              }
+              return tx.connection.update({
+                where: { id: current.id },
+                data: {
+                  status: "connected",
+                  ...(providerRef ? { providerRef } : {}),
+                },
+              });
+            },
+            { timeout: 60_000 },
           );
-          if (ready) {
-            row = await deps.prisma.connection.update({
-              where: { id: existing.id },
-              data: { status: "connected" },
-            });
-          }
         }
         return {
           id: row.id,
@@ -2925,39 +3651,228 @@ export function createRouter(deps: RouterDeps) {
           createdAt: row.createdAt.toISOString(),
         };
       }),
-      revoke: authed.connections.revoke.handler(async ({ context, input }) => {
-        const row = await deps.prisma.connection.findFirst({
+      rename: authed.connections.rename.handler(async ({ context, input }) => {
+        const existing = await deps.prisma.connection.findFirst({
           where: {
             id: input.connectionId,
             spaceId: context.actor.spaceId,
             userId: context.actor.userId,
           },
         });
-        if (row) {
-          const connector = deps.connectors.managed(row.connectorId);
-          if (!connector) {
-            throw new ORPCError("BAD_REQUEST", {
-              message: `Connector ${row.connectorId} is not configured`,
+        if (!existing) throw new IsolationError();
+        const row = await deps.prisma.connection.update({
+          where: { id: existing.id },
+          data: { displayName: input.displayName },
+        });
+        return {
+          id: row.id,
+          connectorId: row.connectorId,
+          provider: row.provider,
+          displayName: row.displayName,
+          status: row.status as "pending" | "connected" | "revoked" | "error",
+          capabilities: [],
+          createdAt: row.createdAt.toISOString(),
+        };
+      }),
+      revoke: authed.connections.revoke.handler(async ({ context, input }) => {
+        type RemoteRevoke = {
+          connectorId: string;
+          connectionRef: string;
+          accountSpecific: boolean;
+        };
+        const outcome = await deps.prisma.$transaction(
+          async (tx) => {
+            const row = await tx.connection.findFirst({
+              where: {
+                id: input.connectionId,
+                spaceId: context.actor.spaceId,
+                userId: context.actor.userId,
+              },
             });
-          }
+            if (!row) {
+              return {
+                remote: null as null | RemoteRevoke,
+                previousStatus: null as string | null,
+              };
+            }
+
+            // Advisory lock covers inserts as well as existing rows. SELECT FOR UPDATE
+            // alone misses a concurrent begin that inserts after the lock query.
+            await lockProviderConnectionScope(tx, context.actor, row.connectorId, row.provider);
+            await tx.$queryRaw`
+              SELECT id
+              FROM connections
+              WHERE "spaceId" = ${context.actor.spaceId}
+                AND "userId" = ${context.actor.userId}
+                AND "connectorId" = ${row.connectorId}
+                AND provider = ${row.provider}
+                AND status IN ('connected', 'pending', 'error')
+              FOR UPDATE`;
+
+            const updated = await tx.connection.updateMany({
+              where: {
+                id: row.id,
+                spaceId: context.actor.spaceId,
+                userId: context.actor.userId,
+                status: { in: ["connected", "pending", "error"] },
+              },
+              data: { status: "revoked" },
+            });
+            if (updated.count === 0) {
+              return {
+                remote: null as null | RemoteRevoke,
+                previousStatus: null as string | null,
+              };
+            }
+
+            const remaining = await tx.connection.count({
+              where: {
+                spaceId: context.actor.spaceId,
+                userId: context.actor.userId,
+                connectorId: row.connectorId,
+                provider: row.provider,
+                status: { in: ["connected", "pending"] },
+              },
+            });
+            const connectionRef = row.providerRef || row.provider;
+            const accountSpecific = Boolean(row.providerRef && row.providerRef !== row.provider);
+            // Account-scoped refs can disconnect one remote authorization while
+            // siblings remain. Slug-only legacy rows must wait until they are last,
+            // or a provider-wide revoke would drop every account for that app.
+            if (!accountSpecific && remaining > 0) {
+              return {
+                remote: null as null | RemoteRevoke,
+                previousStatus: null as string | null,
+              };
+            }
+
+            // Slug-only remote delete is provider-wide. Run it before commit while
+            // still holding the begin/revoke lock so a new authorization cannot be
+            // created and then wiped by Pipedream's slug-scoped DELETE.
+            if (!accountSpecific) {
+              const connector = deps.connectors.managed(row.connectorId);
+              if (!connector) {
+                throw new ORPCError("BAD_REQUEST", {
+                  message: `Connector ${row.connectorId} is not configured`,
+                });
+              }
+              try {
+                // Abort before the 60s Prisma transaction timeout so a late remote
+                // delete cannot succeed after local status has already rolled back.
+                const signals = [AbortSignal.timeout(45_000)];
+                if (context.signal) signals.unshift(context.signal);
+                const revokeSignal = signals.length === 1 ? signals[0]! : AbortSignal.any(signals);
+                await connector.revoke(
+                  connectionRef,
+                  connectionContext(context.actor, "connections.revoke", revokeSignal),
+                );
+              } catch (error) {
+                if (error instanceof ORPCError) throw error;
+                throw new ORPCError("BAD_REQUEST", { message: sanitizeComposioError(error) });
+              }
+              return {
+                remote: null as null | RemoteRevoke,
+                previousStatus: null as string | null,
+              };
+            }
+
+            return {
+              remote: {
+                connectorId: row.connectorId,
+                connectionRef,
+                accountSpecific,
+              },
+              previousStatus: row.status,
+            };
+          },
+          { timeout: 60_000 },
+        );
+
+        if (outcome.remote) {
+          const restoreLocalStatus = async () => {
+            // Local row was marked revoked inside the transaction; restore it so a
+            // failed remote disconnect remains retryable instead of orphaned.
+            if (!outcome.previousStatus) return;
+            await deps.prisma.connection.updateMany({
+              where: {
+                id: input.connectionId,
+                spaceId: context.actor.spaceId,
+                userId: context.actor.userId,
+                status: "revoked",
+              },
+              data: { status: outcome.previousStatus },
+            });
+          };
           try {
+            const connector = deps.connectors.managed(outcome.remote.connectorId);
+            if (!connector) {
+              throw new ORPCError("BAD_REQUEST", {
+                message: `Connector ${outcome.remote.connectorId} is not configured`,
+              });
+            }
             await connector.revoke(
-              row.provider,
+              outcome.remote.connectionRef,
               connectionContext(context.actor, "connections.revoke", context.signal),
             );
           } catch (error) {
+            // Restore when DELETE clearly did not run (including pre-delete list
+            // timeouts). Post-delete timeouts stay ambiguous — leave revoked.
+            if (shouldRestoreLocalAfterRemoteRevokeFailure(error)) {
+              await restoreLocalStatus();
+            } else {
+              getLogger().error(
+                "connections.revoke remote outcome uncertain; leaving local revoked",
+                error,
+                {
+                  connectionId: input.connectionId,
+                  connectorId: outcome.remote.connectorId,
+                },
+              );
+            }
+            if (error instanceof ORPCError) throw error;
             throw new ORPCError("BAD_REQUEST", { message: sanitizeComposioError(error) });
           }
         }
-        await deps.prisma.connection.updateMany({
+        return { ok: true as const };
+      }),
+      tools: authed.connections.tools.handler(async ({ context, input }) => {
+        const connector = deps.connectors.managed(input.connectorId);
+        if (!connector) return [];
+        const row = await deps.prisma.connection.findFirst({
           where: {
-            id: input.connectionId,
             spaceId: context.actor.spaceId,
             userId: context.actor.userId,
+            connectorId: input.connectorId,
+            provider: input.provider,
+            status: "connected",
           },
-          data: { status: "revoked" },
         });
-        return { ok: true as const };
+        if (!row) return [];
+        try {
+          const tools = await connector.discoverTools({
+            ...connectionContext(context.actor, "connections.tools", context.signal),
+            connectedConnections: [
+              {
+                id: row.id,
+                connectorId: input.connectorId,
+                externalId: input.provider,
+                displayName: row.displayName,
+                providerRef: row.providerRef ?? undefined,
+              },
+            ],
+            connectedProviders: [input.provider],
+          });
+          return tools.map((tool) => ({
+            name: tool.name,
+            description: tool.description,
+          }));
+        } catch (error) {
+          getLogger().error("connections.tools failed", error, {
+            connectorId: input.connectorId,
+            provider: input.provider,
+          });
+          return [];
+        }
       }),
     },
     messaging: {
@@ -3224,6 +4139,34 @@ export function createRouter(deps: RouterDeps) {
           return { ok: true as const };
         }),
       },
+    },
+    externalConversations: {
+      updatePolicy: authed.externalConversations.updatePolicy.handler(
+        async ({ context, input }) => {
+          const { externalConversationId, ...policy } = input;
+          return createExternalConversationRepos(deps.prisma).updatePolicy(
+            context.actor,
+            externalConversationId,
+            policy,
+          );
+        },
+      ),
+    },
+    agentSecrets: {
+      list: authed.agentSecrets.list.handler(async ({ context }) =>
+        listAgentSecrets({ prisma: deps.prisma, secrets: deps.secrets }, context.actor),
+      ),
+      put: authed.agentSecrets.put.handler(async ({ context, input, signal }) =>
+        putAgentSecret(
+          { prisma: deps.prisma, secrets: deps.secrets },
+          context.actor,
+          input,
+          signal,
+        ),
+      ),
+      remove: authed.agentSecrets.remove.handler(async ({ context, input }) =>
+        deleteAgentSecret({ prisma: deps.prisma, secrets: deps.secrets }, context.actor, input.id),
+      ),
     },
     approvalRules: {
       list: authed.approvalRules.list.handler(async ({ context }) => {
@@ -3596,15 +4539,40 @@ async function spaceNavigationDto(
   });
   const spaceIds = memberships.map((membership) => membership.spaceId);
   const inactiveSpaceIds = spaceIds.filter((spaceId) => spaceId !== actor.spaceId);
-  const [currentBots, currentGroups, inactiveBots, inactiveGroups, botSections] = await Promise.all(
-    [
-      repos.listBots(actor),
-      groupRepos.listGroups(actor),
-      repos.listSpaceBotsForSpaces(actor, inactiveSpaceIds),
-      groupRepos.listSpaceGroupsForSpaces(actor, inactiveSpaceIds),
-      repos.listBotSectionsForSpaces(actor, spaceIds),
-    ],
-  );
+  const [
+    currentBots,
+    currentGroups,
+    inactiveBots,
+    inactiveGroups,
+    botSections,
+    externalConversations,
+    contentBots,
+    contentGroups,
+  ] = await Promise.all([
+    repos.listBots(actor),
+    groupRepos.listGroups(actor),
+    repos.listSpaceBotsForSpaces(actor, inactiveSpaceIds),
+    groupRepos.listSpaceGroupsForSpaces(actor, inactiveSpaceIds),
+    repos.listBotSectionsForSpaces(actor, spaceIds),
+    createExternalConversationRepos(deps.prisma).listForSpaces(actor, spaceIds),
+    // Active-only navigation lists miss archived content in other spaces; count any
+    // bot/group in the actor's spaces (including another member's) so a shared
+    // non-empty space cannot look empty for onboarding redirects.
+    deps.prisma.bot.findMany({
+      where: { spaceId: { in: spaceIds } },
+      select: { spaceId: true },
+      distinct: ["spaceId"],
+    }),
+    deps.prisma.chatGroup.findMany({
+      where: { spaceId: { in: spaceIds } },
+      select: { spaceId: true },
+      distinct: ["spaceId"],
+    }),
+  ]);
+  const spacesWithContent = new Set([
+    ...contentBots.map((row) => row.spaceId),
+    ...contentGroups.map((row) => row.spaceId),
+  ]);
   const currentMembership = memberships.find((membership) => membership.spaceId === actor.spaceId);
   if (!currentMembership) throw new IsolationError();
   const botsBySpace = partitionBySpace([...currentBots, ...inactiveBots]);
@@ -3620,6 +4588,9 @@ async function spaceNavigationDto(
       name: currentMembership.space.name,
       bots: currentBots,
       groups: currentGroups,
+      externalConversations: externalConversations.filter(
+        (conversation) => conversation.spaceId === actor.spaceId,
+      ),
       botSections: sectionsFor(actor.spaceId),
     },
     spaces: memberships.map((membership) => {
@@ -3629,6 +4600,7 @@ async function spaceNavigationDto(
         id: membership.spaceId,
         name: membership.space.name,
         isDefault: membership.space.isDefault,
+        hasContent: spacesWithContent.has(membership.spaceId),
         bots: spaceBots.map((bot) => ({
           id: bot.id,
           spaceId: bot.spaceId,
@@ -3654,6 +4626,9 @@ async function spaceNavigationDto(
           unread: group.unread,
           updatedAt: group.updatedAt,
         })),
+        externalConversations: externalConversations.filter(
+          (conversation) => conversation.spaceId === membership.spaceId,
+        ),
         botSections: sectionsFor(membership.spaceId),
       };
     }),
@@ -3819,6 +4794,68 @@ async function expireStaleComputerControl(
   return clearInactiveUserComputerControl(deps.prisma, computer.id).catch(() => false);
 }
 
+/** When the user already holds control during waiting_takeover, bind controlRunId so
+ * takeoverRequested becomes true and release can resume the waiting run. */
+async function bindWaitingTakeoverToControl(
+  deps: RouterDeps,
+  input: {
+    spaceId: string;
+    threadId: string | null | undefined;
+    botId: string;
+    computerId: string;
+    controlLeaseId: string;
+    controlRunId: string | null;
+  },
+): Promise<void> {
+  await deps.prisma.$transaction(async (tx) => {
+    // Lock the execution lease so a reclaimed fence/run cannot be bound by a stale read.
+    const locked = await tx.$queryRaw<Array<{ runId: string; fence: number }>>`
+      SELECT "runId", fence FROM computer_execution_leases
+      WHERE "computerId" = ${input.computerId} AND "botId" = ${input.botId}
+      FOR UPDATE`;
+    const executionLease = locked[0];
+    if (!executionLease) return;
+
+    const executionRun = await tx.run.findUnique({
+      where: { id: executionLease.runId },
+      select: { botId: true, status: true },
+    });
+    const waitingForTakeover =
+      executionRun?.botId === input.botId && executionRun.status === "waiting_takeover";
+    if (!waitingForTakeover) return;
+    if (input.controlRunId === executionLease.runId) return;
+
+    // Confirm the locked lease row still matches before writing controlRunId.
+    const leaseStillCurrent = await tx.computerExecutionLease.count({
+      where: {
+        computerId: input.computerId,
+        botId: input.botId,
+        runId: executionLease.runId,
+        fence: executionLease.fence,
+      },
+    });
+    if (leaseStillCurrent !== 1) return;
+
+    const bound = await tx.computer.updateMany({
+      where: {
+        id: input.computerId,
+        controlLeaseId: input.controlLeaseId,
+        controlBotId: input.botId,
+      },
+      data: { controlRunId: executionLease.runId },
+    });
+    if (bound.count !== 1 || !input.threadId) return;
+
+    await deps.events.append({
+      spaceId: input.spaceId,
+      threadId: input.threadId,
+      botId: input.botId,
+      type: "computer.takeover.granted",
+      payload: { leaseId: input.controlLeaseId, takeoverRequested: true },
+    });
+  });
+}
+
 async function computerScreenContext(
   prisma: PrismaClient,
   actor: Actor,
@@ -3937,109 +4974,6 @@ async function persistModelCredential(
   return modelCredentialDto(cred, input.plaintext);
 }
 
-async function requireSpaceOwner(prisma: PrismaClient, actor: Actor): Promise<void> {
-  const member = await prisma.spaceMember.findUnique({
-    where: { spaceId_userId: { spaceId: actor.spaceId, userId: actor.userId } },
-    select: { role: true },
-  });
-  const roles = member?.role.split(",").map((role) => role.trim());
-  if (!roles?.includes("owner")) throw new ORPCError("FORBIDDEN");
-}
-
-export async function persistMemoryProviderConfig(
-  deps: RouterDeps,
-  actor: Actor,
-  input: {
-    provider: string;
-    settings: Record<string, string>;
-    credentials: Record<string, string>;
-    defaultMemoryScope: "isolated" | "shared";
-  },
-) {
-  await requireSpaceOwner(deps.prisma, actor);
-  const prepared = await prepareMemoryProviderConnection(input).catch((error: unknown) => {
-    throw new ORPCError("BAD_REQUEST", {
-      message: error instanceof Error ? error.message : "Memory provider connection failed",
-    });
-  });
-  const stored = await deps.secrets.put(JSON.stringify(prepared.credentials), {
-    operationId: "memory-provider-config",
-    traceId: "memory-provider-config",
-    spaceId: actor.spaceId,
-    userId: actor.userId,
-    signal: new AbortController().signal,
-  });
-  const config = await withSerializableRetry(() =>
-    deps.prisma.$transaction(
-      async (tx) => {
-        const existing = await findSpaceMemoryConfig(tx, actor.spaceId);
-        const secret = await tx.secret.create({
-          data: {
-            id: stored.id,
-            userId: actor.userId,
-            spaceId: actor.spaceId,
-            kind: "memory-provider",
-            ciphertext: stored.ciphertext,
-          },
-        });
-        const updated = await tx.spaceMemoryConfig.upsert({
-          where: { spaceId: actor.spaceId },
-          create: {
-            spaceId: actor.spaceId,
-            userId: actor.userId,
-            provider: prepared.provider,
-            settings: prepared.settings,
-            secretId: secret.id,
-            defaultMemoryScope: input.defaultMemoryScope,
-          },
-          update: {
-            userId: actor.userId,
-            provider: prepared.provider,
-            settings: prepared.settings,
-            secretId: secret.id,
-            defaultMemoryScope: input.defaultMemoryScope,
-          },
-        });
-        if (existing && existing.secretId !== secret.id) {
-          await tx.secret.deleteMany({ where: { id: existing.secretId } });
-        }
-        return updated;
-      },
-      { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
-    ),
-  );
-  return serializeSpaceMemoryConfig(config);
-}
-
-export async function updateMemoryProviderDefaultScope(
-  deps: RouterDeps,
-  actor: Actor,
-  defaultMemoryScope: "isolated" | "shared",
-) {
-  await requireSpaceOwner(deps.prisma, actor);
-  const existing = await findSpaceMemoryConfig(deps.prisma, actor.spaceId);
-  if (!existing) throw new ORPCError("NOT_FOUND");
-  const updated = await deps.prisma.spaceMemoryConfig.update({
-    where: { id: existing.id },
-    data: { defaultMemoryScope },
-  });
-  return serializeSpaceMemoryConfig(updated);
-}
-
-function serializeSpaceMemoryConfig(config: {
-  provider: string;
-  settings: unknown;
-  defaultMemoryScope: string;
-  updatedAt: Date;
-}) {
-  return {
-    provider: config.provider,
-    settings: toStringRecord(config.settings),
-    defaultMemoryScope: config.defaultMemoryScope as "isolated" | "shared",
-    updatedAt: config.updatedAt.toISOString(),
-  };
-}
-
 function throwIfAborted(signal?: AbortSignal) {
   if (signal?.aborted) throw signal.reason ?? new Error("Request cancelled");
 }
@@ -4065,6 +4999,8 @@ function mapRoutine(row: {
   active: boolean;
   notify: boolean;
   webhookEnabled: boolean;
+  githubEnabled: boolean;
+  messageProvider: string | null;
   lastRunAt: Date | null;
   nextRunAt: Date | null;
   createdAt: Date;
@@ -4079,6 +5015,8 @@ function mapRoutine(row: {
     active: row.active,
     notify: row.notify,
     webhookEnabled: row.webhookEnabled,
+    githubEnabled: row.githubEnabled,
+    messageProvider: row.messageProvider,
     lastRunAt: row.lastRunAt?.toISOString() ?? null,
     nextRunAt: row.nextRunAt?.toISOString() ?? null,
     createdAt: row.createdAt.toISOString(),

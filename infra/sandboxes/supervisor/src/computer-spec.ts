@@ -1,63 +1,45 @@
 import { createHash } from "node:crypto";
+import { MAX_DESKTOP_DISPLAY, screenPorts } from "@rakazo/core/node/desktop-runtime";
 
 export const COMPUTER_IMAGE = process.env.RAKAZO_COMPUTER_IMAGE ?? "rakazo/computer:local";
 export const COMPUTER_UID = 1000;
 export const COMPUTER_GID = 1000;
 export const COMPUTER_USER = `${COMPUTER_UID}:${COMPUTER_GID}`;
-export const TEAM_SCREEN_LIMIT = 8;
+
+export { screenPorts };
 export const COMPUTER_CONTROL_PORT = 7070;
 export const SCREEN_HOST = process.env.SANDBOX_SCREEN_HOST ?? "127.0.0.1";
 export type ScreenNetworkMode = "published" | "internal" | "isolated";
 
-export function resolveScreenNetworkMode(value: string | undefined): ScreenNetworkMode {
-  if (!value || value === "published") return "published";
-  if (value === "internal" || value === "isolated") return value;
-  throw new Error(`Unsupported SANDBOX_SCREEN_NETWORK value: ${value}`);
+export function resolveTeamScreenLimit(value = process.env.SANDBOX_TEAM_SCREEN_LIMIT): number {
+  if (value === undefined || value.trim() === "" || isUnlimited(value)) return MAX_DESKTOP_DISPLAY;
+  const limit = Number(value);
+  if (!Number.isSafeInteger(limit) || limit < 1) {
+    throw new Error(
+      "SANDBOX_TEAM_SCREEN_LIMIT must be a positive integer, or 0 for no configured cap",
+    );
+  }
+  return Math.min(limit, MAX_DESKTOP_DISPLAY);
 }
-
-export function hostComputerUser(uid = process.getuid?.(), gid = process.getgid?.()): string {
-  if (uid === undefined || gid === undefined || uid === 0) return COMPUTER_USER;
-  return `${uid}:${gid}`;
-}
-
-/**
- * Host address the computer's screen ports are published on.
- *
- * The default binds to loopback, which is right when the supervisor and the web
- * app run directly on the same host as the bot containers. It breaks silently
- * the moment they are containerised, as they are in docker-compose.prod.yml:
- * the supervisor publishes the screen on the host's 127.0.0.1, then probes it
- * at SANDBOX_SCREEN_HOST, and from inside its own network namespace that
- * address is not the host. The probe cannot succeed, so it hangs for its full
- * timeout on every attempt, the run re-queues, and the bot never answers. The
- * failure surfaces as a run that loops "running -> queued" with no error, which
- * looks like a model problem and is not.
- *
- * Set this to an address the sibling containers can reach. The docker bridge
- * gateway is the right choice: siblings reach it, and unlike 0.0.0.0 it does
- * not put an unauthenticated VNC port on the LAN. Browsers never touch it
- * directly; the web app's signed screen proxy is the only path in.
- */
-export const COMPUTER_BIND_HOST = process.env.RAKAZO_COMPUTER_BIND_HOST ?? "127.0.0.1";
 
 /**
  * Resource ceilings for a bot computer.
  *
  * A computer runs Xvfb, a window manager and a full Chromium on behalf of an
- * agent that decides for itself what to open. Without a ceiling one bot's
- * runaway page is a host-wide memory and CPU event that takes every other bot
- * and the Rakazo services down with it, which is the same reason every service
- * in docker-compose.prod.yml carries mem_limit and pids_limit.
+ * agent that decides for itself what to open. #343 gave these containers a
+ * pids ceiling, but Memory and NanoCpus are still unset, so one runaway page is
+ * a host-wide memory and CPU event that takes every other bot and the Rakazo
+ * services down with it. Every service in docker-compose.prod.yml already
+ * carries mem_limit; this applies the same discipline to the containers that
+ * actually run untrusted page content.
  *
- * Defaults are deliberately generous enough for real browsing and small enough
- * that a single computer cannot exhaust a documented 8 GB host. Set any of
- * these to "0" or "unlimited" to restore the previous uncapped behaviour.
+ * Defaults are a starting point for the Docker computer topology: generous enough
+ * for real browsing, small enough that one computer cannot starve the host or
+ * sibling bots. The pids default is #343's existing 2048, unchanged. Set any of
+ * these to "0", "none" or "unlimited" to opt out.
  */
 const DEFAULT_COMPUTER_MEMORY = "2g";
 const DEFAULT_COMPUTER_CPUS = "2";
-// #343's chosen ceiling, kept as the default so this fork does not quietly retune
-// a number upstream picked. This deployment overrides it to 512 in
-// ops/compose/docker-compose.sandbox.yml, where the sizing sits next to its host.
 const DEFAULT_COMPUTER_PIDS_LIMIT = "2048";
 /** The daemon refuses HostConfig.Memory below this at container creation. */
 const MIN_DOCKER_MEMORY_BYTES = 6 * 1024 ** 2;
@@ -86,8 +68,8 @@ export function parseMemoryBytes(name: string, raw: string): number {
   if (!Number.isSafeInteger(bytes) || bytes <= 0) {
     throw new Error(`${name} must resolve to a positive byte count, received "${raw}"`);
   }
-  // The daemon rejects a limit under 6 MiB at container creation, so catching it
-  // here turns a per-bot 500 into a startup failure that names the variable.
+  // The daemon rejects a limit under 6 MiB at container creation. Catching it here turns a
+  // per-bot 500 at the first `POST /computers` into a startup failure that names the variable.
   if (bytes < MIN_DOCKER_MEMORY_BYTES) {
     throw new Error(`${name} must be at least 6m, Docker's minimum, received "${raw}"`);
   }
@@ -98,11 +80,10 @@ export function parseMemoryBytes(name: string, raw: string): number {
 export function parseNanoCpus(name: string, raw: string): number {
   if (isUnlimited(raw)) return 0;
   const value = Number(raw.trim());
-  // A positive value below 1e-9 floors to 0 nanocpus, which Docker reads as
-  // *unlimited*. Check the converted number, not just the input, so an accepted
-  // limit can never silently become no limit.
+  // Tiny positives floor to 0 nanocpus (Docker reads as unlimited). Huge values leave the
+  // safe-integer range or become Infinity. Validate the converted number either way.
   const nanoCpus = Math.floor(value * 1e9);
-  if (!Number.isFinite(value) || value <= 0 || nanoCpus <= 0) {
+  if (!Number.isSafeInteger(nanoCpus) || nanoCpus <= 0) {
     throw new Error(`${name} must be a positive number of CPUs, received "${raw}"`);
   }
   return nanoCpus;
@@ -194,34 +175,29 @@ export function computerExtraMounts(
     });
 }
 
-export function screenPorts(index: number) {
-  if (index < 0 || index >= TEAM_SCREEN_LIMIT) {
-    throw new Error(
-      `screen index ${index} exceeds the Team Computer limit of ${TEAM_SCREEN_LIMIT}`,
-    );
-  }
-  return {
-    display: `:${index + 1}`,
-    displayNumber: index + 1,
-    viewPort: String(6080 + index * 2),
-    controlPort: String(6081 + index * 2),
-    viewVncPort: 5900 + index * 2,
-    controlVncPort: 5901 + index * 2,
-  };
+export function resolveScreenNetworkMode(value: string | undefined): ScreenNetworkMode {
+  if (!value || value === "published") return "published";
+  if (value === "internal" || value === "isolated") return value;
+  throw new Error(`Unsupported SANDBOX_SCREEN_NETWORK value: ${value}`);
 }
 
-export function computerPortBindings() {
+export function hostComputerUser(uid = process.getuid?.(), gid = process.getgid?.()): string {
+  if (uid === undefined || gid === undefined || uid === 0) return COMPUTER_USER;
+  return `${uid}:${gid}`;
+}
+
+export function computerPortBindings(publishControlPort = false) {
   const ExposedPorts: Record<string, object> = {};
   const PortBindings: Record<string, Array<{ HostIp: string; HostPort: string }>> = {};
-  for (let index = 0; index < TEAM_SCREEN_LIMIT; index += 1) {
-    const ports = screenPorts(index);
-    ExposedPorts[`${ports.viewPort}/tcp`] = {};
-    ExposedPorts[`${ports.controlPort}/tcp`] = {};
-    PortBindings[`${ports.viewPort}/tcp`] = [{ HostIp: COMPUTER_BIND_HOST, HostPort: "0" }];
-    PortBindings[`${ports.controlPort}/tcp`] = [{ HostIp: COMPUTER_BIND_HOST, HostPort: "0" }];
+  const port = `${screenPorts(0).viewPort}/tcp`;
+  ExposedPorts[port] = {};
+  PortBindings[port] = [{ HostIp: "127.0.0.1", HostPort: "0" }];
+  // Host-run Docker Desktop supervisors need an opt-in loopback mapping.
+  // Otherwise control stays unpublished on the container network.
+  if (publishControlPort) {
+    ExposedPorts[`${COMPUTER_CONTROL_PORT}/tcp`] = {};
+    PortBindings[`${COMPUTER_CONTROL_PORT}/tcp`] = [{ HostIp: "127.0.0.1", HostPort: "0" }];
   }
-  // Control stays on the container network only (0.0.0.0 inside the container).
-  // Do not publish 7070 to the host.
   return { ExposedPorts, PortBindings };
 }
 
@@ -234,6 +210,7 @@ export interface ComputerCreateInput {
   user?: string;
   controlToken?: string;
   networkMode?: string;
+  publishControlPort?: boolean;
 }
 
 interface PointerInput {
@@ -250,7 +227,7 @@ export type SandboxInput =
   | { kind: "clipboard"; text: string };
 
 export function containerCreateOptions(input: ComputerCreateInput) {
-  const ports = computerPortBindings();
+  const ports = computerPortBindings(input.publishControlPort);
   return {
     Image: input.image,
     name: input.name,
@@ -279,8 +256,6 @@ export function containerCreateOptions(input: ComputerCreateInput) {
       ShmSize: 256 * 1024 * 1024,
       CapDrop: ["ALL"],
       SecurityOpt: ["no-new-privileges:true"],
-      // After #343's hardening, so this deployment's configured ceilings win over
-      // the literal PidsLimit it sets. Memory and NanoCpus are ours alone.
       ...computerResourceLimits(),
       ReadonlyPaths: ["/usr/share/novnc"],
       AutoRemove: false,
@@ -333,6 +308,12 @@ export function screenUrlFor(hostPort: string, host = SCREEN_HOST) {
   return `http://${host}:${hostPort}/embed.html`;
 }
 
+export function screenUrlWithToken(screenUrl: string, token: string) {
+  const url = new URL(screenUrl);
+  url.searchParams.set("path", `websockify?token=${encodeURIComponent(token)}`);
+  return url.toString();
+}
+
 /**
  * Decide which host:port clients (and readiness probes) should use.
  *
@@ -359,17 +340,65 @@ export function resolveScreenPublishTarget(input: {
   return undefined;
 }
 
+type ControlPortBindings =
+  | Record<string, Array<{ HostIp?: string; HostPort?: string }> | null | undefined>
+  | null
+  | undefined;
+
+function validHostPort(port: string | undefined): port is string {
+  return !!port && /^\d{1,5}$/.test(port) && Number(port) > 0 && Number(port) <= 65535;
+}
+
+/** Resolve an assigned runtime port only when every control binding is loopback. */
+export function publishedLoopbackControlHostPort(portBindings: ControlPortBindings) {
+  const bindings = portBindings?.[`${COMPUTER_CONTROL_PORT}/tcp`];
+  if (!bindings?.length || bindings.some((binding) => binding.HostIp !== "127.0.0.1")) {
+    return undefined;
+  }
+  return bindings.find((binding) => validHostPort(binding.HostPort))?.HostPort;
+}
+
 /**
- * Resolve the in-container control service via its Docker network IP.
- * Control is never host-published; the supervisor reaches 7070 on the
- * container network while the process binds 0.0.0.0 inside the sandbox.
+ * Reuse only containers whose configured control publication matches the setting.
+ * Inspect HostConfig so stopped containers and Docker's automatic port allocation
+ * (empty or zero HostPort) work before a runtime port has been assigned.
+ */
+export function controlPortPublicationMatches(
+  portBindings: ControlPortBindings,
+  publishControlPort: boolean,
+): boolean {
+  const bindings = portBindings?.[`${COMPUTER_CONTROL_PORT}/tcp`];
+  if (!publishControlPort) return !bindings?.length;
+  return (
+    !!bindings?.length &&
+    bindings.every(
+      (binding) =>
+        binding.HostIp === "127.0.0.1" &&
+        (binding.HostPort === "" || binding.HostPort === "0" || validHostPort(binding.HostPort)),
+    )
+  );
+}
+
+/**
+ * Resolve the computer control service. Prefer a published loopback HostPort
+ * when provided; otherwise use the Docker network IP. When requirePublishedHostPort
+ * is set, never fall back to the container IP (unreachable from Docker Desktop hosts).
  */
 export function resolveComputerControlEndpoint(input: {
   token: string | undefined;
   networkMode: string | null | undefined;
   networks: Record<string, { IPAddress?: string } | undefined> | null | undefined;
+  publishedHostPort?: string;
+  requirePublishedHostPort?: boolean;
 }): { url: string; token: string } | undefined {
   if (!input.token) return undefined;
+  if (validHostPort(input.publishedHostPort)) {
+    return {
+      url: `http://127.0.0.1:${input.publishedHostPort}/v1/desktop`,
+      token: input.token,
+    };
+  }
+  if (input.requirePublishedHostPort) return undefined;
   const address =
     (input.networkMode ? input.networks?.[input.networkMode]?.IPAddress : undefined) ||
     Object.values(input.networks ?? {}).find((network) => network?.IPAddress)?.IPAddress;

@@ -10,6 +10,8 @@ import {
 import {
   acquireComputerExecutionLease,
   appendRecordingEvent,
+  ComputerBusyError,
+  type ComputerExecutionLease,
   captureTeachingSnapshot,
   completeTeachingSession,
   emptyRecording,
@@ -39,6 +41,7 @@ import {
   teachRecordingTtlMs,
 } from "@rakazo/core";
 import {
+  type createRepos,
   expireComputerExecutionLeases,
   IsolationError,
   type PrismaClient,
@@ -133,7 +136,7 @@ async function cancelActiveRuns(
 async function ensureGraphicalComputer(
   deps: TaughtSkillsDeps,
   actor: Actor,
-  bot: Awaited<ReturnType<ReturnType<typeof import("@rakazo/db").createRepos>["getBot"]>>,
+  bot: Awaited<ReturnType<ReturnType<typeof createRepos>["getBot"]>>,
 ) {
   if (bot.computer?.kind === "desktop") {
     throw new ORPCError("BAD_REQUEST", {
@@ -144,16 +147,29 @@ async function ensureGraphicalComputer(
   if (bot.computer.state !== "running" || !bot.computer.providerRef) {
     const ctx = computerContext(actor, bot.id, "skills.start");
     const manualRunId = `teach:${randomUUID()}`;
-    const lease = await acquireComputerExecutionLease(deps.prisma, {
-      computerId: bot.computer.id,
-      runId: manualRunId,
-      botId: bot.id,
-    });
+    let lease: ComputerExecutionLease | null;
+    try {
+      lease = await acquireComputerExecutionLease(deps.prisma, {
+        computerId: bot.computer.id,
+        runId: manualRunId,
+        botId: bot.id,
+      });
+    } catch (error) {
+      if (error instanceof ComputerBusyError) {
+        throw new ORPCError("CONFLICT", { message: "Computer is busy" });
+      }
+      throw error;
+    }
     try {
       await provisionComputer(deps, bot.computer.id, {
         ...ctx,
         screenLeaseId: screenLeaseIdForRun(lease, manualRunId),
       });
+    } catch (error) {
+      if (error instanceof ComputerBusyError) {
+        throw new ORPCError("CONFLICT", { message: "Computer is busy" });
+      }
+      throw error;
     } finally {
       await releaseComputerExecutionLease(deps.prisma, lease);
     }
@@ -176,7 +192,7 @@ async function ensureGraphicalComputer(
 async function grantTakeover(
   deps: TaughtSkillsDeps,
   actor: Actor,
-  bot: Awaited<ReturnType<ReturnType<typeof import("@rakazo/db").createRepos>["getBot"]>>,
+  bot: Awaited<ReturnType<ReturnType<typeof createRepos>["getBot"]>>,
   until: Date,
 ): Promise<{ bot: typeof bot; leaseId: string }> {
   if (!bot.computer) throw new IsolationError();

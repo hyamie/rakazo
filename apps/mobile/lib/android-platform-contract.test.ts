@@ -30,7 +30,8 @@ describe("Android mobile platform contract", () => {
     expect(thread).not.toContain("automaticOffset");
     expect(thread).not.toContain("KeyboardStickyView");
     expect(thread).toContain("useSafeAreaInsets");
-    expect(thread).toContain("Math.max(insets.bottom + 12, 24)");
+    expect(thread).toContain("useKeyboardState");
+    expect(thread).toContain("keyboardVisible ? 12 : Math.max(insets.bottom + 12, 24)");
   });
 
   it("requests live-update promotion and exposes its Android settings", () => {
@@ -139,6 +140,17 @@ describe("Android mobile platform contract", () => {
     expect(notifications).toContain("dismissNotificationAsync");
   });
 
+  it("renders the per-message transport in every native channel-message path", () => {
+    const thread = readFileSync(resolve(mobileRoot, "app/thread.tsx"), "utf8");
+    expect(
+      thread.match(/messagingProviderLabel\(block\.provider, block\.transport\)/g),
+    ).toHaveLength(2);
+    expect(thread).toContain(
+      "messagingProviderLabel(channelMessage.provider, channelMessage.transport)",
+    );
+    expect(thread).not.toMatch(/messagingProviderLabel\((?:block|channelMessage)\.provider\)/);
+  });
+
   it("reconciles finished agents and opens ordinary chats at the latest message", () => {
     const thread = readFileSync(resolve(mobileRoot, "app/thread.tsx"), "utf8");
     const scroll = readFileSync(resolve(mobileRoot, "lib/thread-scroll.ts"), "utf8");
@@ -155,6 +167,13 @@ describe("Android mobile platform contract", () => {
     expect(thread).toContain("inGroup && workingGroupBots.length > 0 ?");
     expect(thread).toContain("workingGroupBots.length - index");
     expect(thread).toContain("agents working");
+    // Visible chrome is avatar-only; copy stays on accessibilityLabel.
+    expect(thread).toMatch(
+      /accessibilityLabel=\{\s*workingGroupBots\.length === 1[\s\S]*agents working/,
+    );
+    expect(thread).not.toMatch(
+      /workingGroupBots\.length === 1\s*\?[\s\S]*<Text[^>]*>\s*\{t\("\{name\} is working"/,
+    );
   });
 
   it("keeps send and stop separate while steering active work", () => {

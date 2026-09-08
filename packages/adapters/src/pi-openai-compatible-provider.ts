@@ -48,9 +48,10 @@ const OPENAI_COMPAT_BASE = "http://127.0.0.1:1/v1";
 const resolveHostname: ResolveHostname = (hostname) =>
   lookup(hostname, { all: true, verbatim: true });
 
-function openAiCompatibleModel(
+export function openAiCompatibleModel(
   id: string,
   baseUrl: string,
+  reasoning = false,
   acceptsImages = false,
 ): Model<"openai-completions"> {
   return {
@@ -59,15 +60,17 @@ function openAiCompatibleModel(
     api: "openai-completions",
     provider: OPENAI_COMPATIBLE_PROVIDER_ID,
     baseUrl,
-    reasoning: false,
+    reasoning,
+    compat: {
+      supportsDeveloperRole: false,
+      supportsReasoningEffort: reasoning,
+      thinkingFormat: "openai",
+    },
+    thinkingLevelMap: { off: "none" },
     input: inputModalities(acceptsImages),
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: DEFAULT_CONTEXT_WINDOW,
     maxTokens: DEFAULT_MAX_TOKENS,
-    compat: {
-      supportsDeveloperRole: false,
-      supportsReasoningEffort: false,
-    },
   };
 }
 
@@ -225,12 +228,24 @@ export function openAiCompatibleCatalogProvider(): Provider {
   // The vision gate resolves against this catalog rather than the per-run
   // registry, so a model only declared at runtime would still read as
   // text-only. Register the operator's declared vision models here too.
-  const visionModels = [...openAiCompatibleVisionModelIds()].map((id) =>
-    openAiCompatibleModel(id, OPENAI_COMPAT_BASE, true),
-  );
+  //
+  // If the reserved placeholder id ("custom") is itself declared vision-
+  // capable, upgrade the placeholder entry rather than appending a second
+  // model with the same id — Models.getModel returns the first match, so a
+  // duplicate would leave the gate reading the text-only placeholder.
+  const visionIds = openAiCompatibleVisionModelIds();
+  const placeholderAcceptsImages = visionIds.has(OPENAI_COMPATIBLE_CATALOG_MODEL_ID);
+  const visionModels = [...visionIds]
+    .filter((id) => id !== OPENAI_COMPATIBLE_CATALOG_MODEL_ID)
+    .map((id) => openAiCompatibleModel(id, OPENAI_COMPAT_BASE, false, true));
   return openAiCompatibleProvider([
     {
-      ...openAiCompatibleModel(OPENAI_COMPATIBLE_CATALOG_MODEL_ID, OPENAI_COMPAT_BASE),
+      ...openAiCompatibleModel(
+        OPENAI_COMPATIBLE_CATALOG_MODEL_ID,
+        OPENAI_COMPAT_BASE,
+        false,
+        placeholderAcceptsImages,
+      ),
       name: "Custom model id",
     },
     ...visionModels,
@@ -245,13 +260,15 @@ export function registerOpenAiCompatibleCatalog(models: MutableModels): MutableM
 /** Register a concrete model + base URL for an agent run. */
 export function registerOpenAiCompatibleRuntime(
   models: MutableModels,
-  opts: { modelId: string; baseUrl: string },
+  opts: { modelId: string; baseUrl: string; reasoning?: boolean },
 ): MutableModels {
   const baseUrl = normalizeOpenAiCompatibleBaseUrl(opts.baseUrl);
   const modelId = opts.modelId.trim();
   const acceptsImages = openAiCompatibleVisionModelIds().has(modelId);
   models.setProvider(
-    openAiCompatibleProvider([openAiCompatibleModel(modelId, baseUrl, acceptsImages)]),
+    openAiCompatibleProvider([
+      openAiCompatibleModel(modelId, baseUrl, opts.reasoning, acceptsImages),
+    ]),
   );
   return models;
 }

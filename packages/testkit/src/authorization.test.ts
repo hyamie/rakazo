@@ -4,10 +4,11 @@ import path from "node:path";
 import { ComposioEmulator } from "@rakazo/adapters";
 import type { appContract, Space, SpaceNavigation } from "@rakazo/contracts";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import type { createApp } from "../../../apps/api/src/app.ts";
 import { sessionCookieHeader } from "./index.js";
 
 type App = { request: (input: string, init?: RequestInit) => Response | Promise<Response> };
-type AppHandles = Awaited<ReturnType<typeof import("../../../apps/api/src/app.ts").createApp>>;
+type AppHandles = Awaited<ReturnType<typeof createApp>>;
 type RpcPath<T, Prefix extends string = ""> = T extends { "~orpc": unknown }
   ? Prefix
   : T extends object
@@ -68,6 +69,7 @@ describeWithDatabase("API authorization and resource isolation", () => {
       ["models/setDefault", { provider: "test", modelId: "test/model" }],
       ["spaces/list"],
       ["spaces/create", { name: "Nope" }],
+      ["spaces/remove", { spaceId: "missing-space" }],
       ["bots/list"],
       ["bots/listArchived"],
       ["bots/get", { botId: "missing-bot" }],
@@ -834,6 +836,152 @@ describeWithDatabase("API authorization and resource isolation", () => {
     expect(await missing.text()).toMatch(/credential/i);
   });
 
+  it("deletes only empty, non-default spaces", async () => {
+    const cookie = await signup(app, `space-delete-${stamp}@rakazo.test`, "Space Delete");
+    const actor = await rpc<Actor>(app, cookie, "me");
+    const empty = await rpc<Space>(app, cookie, "spaces/create", { name: "Temporary" });
+    const busy = await rpc<Space>(app, cookie, "spaces/create", { name: "Busy" });
+    await rpc<Bot>(app, cookie, "bots/create", botInput("Busy bot"), busy.id);
+
+    await expect(raw(app, cookie, "spaces/remove", { spaceId: busy.id })).resolves.toMatchObject({
+      status: 400,
+    });
+    await expect(
+      handles.prisma.space.findUnique({ where: { id: busy.id } }),
+    ).resolves.not.toBeNull();
+    await expect(
+      raw(app, cookie, "spaces/remove", { spaceId: actor.spaceId }),
+    ).resolves.toMatchObject({ status: 400 });
+    await expect(
+      raw(app, cookie, "spaces/remove", { spaceId: "missing-space" }),
+    ).resolves.toMatchObject({ status: 404 });
+
+    const removed = await rpc<{ ok: true; activeSpaceId: string }>(app, cookie, "spaces/remove", {
+      spaceId: empty.id,
+    });
+    expect(removed).toEqual({ ok: true, activeSpaceId: actor.spaceId });
+    await expect(handles.prisma.space.findUnique({ where: { id: empty.id } })).resolves.toBeNull();
+    const navigation = await rpc<SpaceNavigation>(app, cookie, "spaces/list");
+    expect(navigation.spaces.map((space) => space.id)).not.toContain(empty.id);
+
+    const intruder = await signup(app, `space-delete-intruder-${stamp}@rakazo.test`, "Intruder");
+    await expect(raw(app, intruder, "spaces/remove", { spaceId: busy.id })).resolves.toMatchObject({
+      status: 404,
+    });
+
+    // Shared-space members must not delete; only the SpaceMember owner may.
+    const shared = await rpc<Space>(app, cookie, "spaces/create", { name: "Shared empty" });
+    const sharedRow = await handles.prisma.space.findUniqueOrThrow({
+      where: { id: shared.id },
+      select: { organizationId: true },
+    });
+    const memberCookie = await signup(
+      app,
+      `space-delete-member-${stamp}@rakazo.test`,
+      "Space Member",
+    );
+    const memberActor = await rpc<Actor>(app, memberCookie, "me");
+    await handles.prisma.member.deleteMany({ where: { userId: memberActor.userId } });
+    await handles.prisma.member.create({
+      data: {
+        id: `space-delete-org-member-${stamp}`,
+        organizationId: sharedRow.organizationId,
+        userId: memberActor.userId,
+        role: "member",
+        createdAt: new Date(),
+      },
+    });
+    await handles.prisma.spaceMember.create({
+      data: {
+        id: `space-delete-space-member-${stamp}`,
+        spaceId: shared.id,
+        organizationId: sharedRow.organizationId,
+        userId: memberActor.userId,
+        role: "member",
+        createdAt: new Date(),
+      },
+    });
+    await expect(
+      raw(app, memberCookie, "spaces/remove", { spaceId: shared.id }, shared.id),
+    ).resolves.toMatchObject({ status: 403 });
+    await expect(
+      handles.prisma.space.findUnique({ where: { id: shared.id } }),
+    ).resolves.not.toBeNull();
+
+    // Another member's bot still counts as content for onboarding emptiness.
+    const ownerBot = await rpc<Bot>(
+      app,
+      cookie,
+      "bots/create",
+      botInput("Owner shared bot"),
+      shared.id,
+    );
+    const memberNavigation = await rpc<SpaceNavigation>(
+      app,
+      memberCookie,
+      "spaces/list",
+      {},
+      shared.id,
+    );
+    expect(memberNavigation.spaces).toEqual(
+      expect.arrayContaining([expect.objectContaining({ id: shared.id, hasContent: true })]),
+    );
+
+    await rpc(app, cookie, "bots/remove", { botId: ownerBot.id, deleteMemories: true }, shared.id);
+    const ownerRemoved = await rpc<{ ok: true; activeSpaceId: string }>(
+      app,
+      cookie,
+      "spaces/remove",
+      {
+        spaceId: shared.id,
+      },
+    );
+    expect(ownerRemoved.ok).toBe(true);
+    await expect(handles.prisma.space.findUnique({ where: { id: shared.id } })).resolves.toBeNull();
+  });
+
+  it("validates custom thinking against the saved connection capability", async () => {
+    const cookie = await signup(app, `custom-thinking-${stamp}@rakazo.test`, "Custom Thinking");
+    const bot = await rpc<Bot>(app, cookie, "bots/create", botInput("Thinking Bot"));
+    const connection = {
+      provider: "openai-compatible",
+      modelId: "arbitrary-model",
+      baseUrl: "http://localhost:8000/v1",
+    };
+    await rpc(app, cookie, "models/connect", {
+      ...connection,
+      apiKey: "fake-saved-key",
+      reasoning: false,
+    });
+    await rpc(app, cookie, "models/connect", { ...connection, reasoning: true });
+    const actor = await rpc<Actor>(app, cookie, "me");
+    expect(
+      await handles.executor.resolveModel({
+        userId: actor.userId,
+        spaceId: actor.spaceId,
+        botId: bot.id,
+      }),
+    ).toMatchObject({ apiKey: "fake-saved-key", reasoning: true });
+    const update = {
+      botId: bot.id,
+      modelProvider: connection.provider,
+      modelId: connection.modelId,
+    };
+    expect(
+      await rpc(app, cookie, "bots/update", { ...update, thinkingLevel: "low" }),
+    ).toMatchObject({ thinkingLevel: "low" });
+    expect(
+      (await raw(app, cookie, "bots/update", { ...update, thinkingLevel: "xhigh" })).status,
+    ).toBe(400);
+    await rpc(app, cookie, "models/connect", { ...connection, reasoning: false });
+    expect(
+      (await raw(app, cookie, "bots/update", { ...update, thinkingLevel: "low" })).status,
+    ).toBe(400);
+    expect(
+      await rpc(app, cookie, "bots/update", { ...update, thinkingLevel: "off" }),
+    ).toMatchObject({ thinkingLevel: "off" });
+  });
+
   it("validates per-bot model overrides against connected providers and catalog", async () => {
     const cookie = await signup(app, `bot-model-${stamp}@rakazo.test`, "Bot Model");
     const bot = await rpc<
@@ -971,6 +1119,12 @@ describeWithDatabase("API authorization and resource isolation", () => {
     const other = await signup(app, `deployment-other-${stamp}@rakazo.test`, "Deployment Other");
     const ownerActor = await rpc<Actor>(app, owner, "me");
     const otherActor = await rpc<Actor>(app, other, "me");
+    // This test changes a live allowlist; the operator has already proved
+    // ownership of the mailbox. Endpoint verification has offline auth tests.
+    await handles.prisma.user.update({
+      where: { id: ownerActor.userId },
+      data: { emailVerified: true },
+    });
     await handles.prisma.deploymentSettings.update({
       where: { id: "default" },
       data: {
@@ -1025,7 +1179,17 @@ describeWithDatabase("API authorization and resource isolation", () => {
       });
       expect(disallowedSignup.status).toBe(400);
       expect(await disallowedSignup.text()).toContain("Email is not allowed to register");
-      await signup(app, approvedEmail, "Approved Signup");
+      const unverifiedSignup = await app.request("/api/auth/sign-up/email", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          email: approvedEmail,
+          password: "password123",
+          name: "Approved Signup",
+        }),
+      });
+      expect(unverifiedSignup.status).toBe(400);
+      expect(await unverifiedSignup.text()).toContain("Registration requires email delivery");
     } finally {
       await rpc(app, owner, "deployment/update", {
         signupsEnabled: true,

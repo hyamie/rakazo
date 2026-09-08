@@ -67,22 +67,24 @@ exists.
 
 ## Carried patches
 
-Both are on their own branches off `main`, merged into `deploy/hds`, and are
-written to be opened upstream as-is.
+Both of the patches this fork used to carry here are now upstream, so they are no
+longer fork-local and no longer need re-applying on a sync:
 
-**`feat/configurable-vision-modalities`** — `local` and `openai-compatible`
-models hardcode `input: ["text"]`, and `modelAcceptsImageInput` gates the
-screenshot-returning computer tools on `input.includes("image")`. A vision model
-behind LiteLLM therefore silently loses `computer_observe`, `computer_act`,
-`open_path` and `launch_app`, and no bot can drive a computer. Adds
-`RAKAZO_OPENAI_COMPATIBLE_VISION_MODELS` / `RAKAZO_LOCAL_VISION_MODELS` so the
-operator can declare what their endpoint actually serves. Text-only stays the
-default. Refs upstream #199 and #203.
+- **Configurable vision modalities** (`RAKAZO_LOCAL_VISION_MODELS` and its
+  `openai-compatible` sibling) landed upstream in #615. Without it a vision model
+  behind a self-hosted gateway silently lost the screenshot-returning computer
+  tools, because `local` and `openai-compatible` models hardcoded `input: ["text"]`.
+- **Bot computer resource ceilings** (`Memory`, `NanoCpus`, `PidsLimit` on every
+  bot computer) landed upstream in #725. Before it, `containerCreateOptions` set
+  `ShmSize` and nothing else.
 
-**`feat/sandbox-resource-limits`** — `containerCreateOptions` set `ShmSize` and
-nothing else, so every bot computer ran with no `Memory`, `NanoCpus` or
-`PidsLimit`. Adds all three with 2g / 2 CPUs / 512 pids defaults, overridable,
-and opt-out via `"0"`, `"none"` or `"unlimited"`.
+A third fork patch, the configurable computer screen bind host, is **retired**
+rather than upstreamed. Upstream now resolves the screen publish target itself
+and binds the published port to loopback unconditionally, which is the behaviour
+this deployment already runs with; the env var it added is gone from the
+deployment and from the code.
+
+What remains fork-local is listed under Models below.
 
 ## Models
 
