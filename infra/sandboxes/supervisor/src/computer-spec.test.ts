@@ -10,7 +10,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   COMPUTER_IMAGE,
   computerExtraMounts,
@@ -18,18 +18,37 @@ import {
   computerNetworkNamesForCleanup,
   containerCreateOptions,
   containerNameFor,
+  controlPortPublicationMatches,
   hostComputerUser,
   legacyNetworkOwnedSolelyBy,
   parseMemoryBytes,
+  publishedLoopbackControlHostPort,
   resolveComputerControlEndpoint,
   resolveScreenNetworkMode,
   resolveScreenPublishTarget,
+  resolveTeamScreenLimit,
   screenPorts,
   screenUrlFor,
+  screenUrlWithToken,
   xdotoolCommand,
 } from "./computer-spec.js";
 
 describe("graphical computer spec", () => {
+  it("binds the embed WebSocket path to the current screen capability", () => {
+    const url = new URL(screenUrlWithToken("http://screen.test:6080/embed.html", "current-token"));
+    expect(url.pathname).toBe("/embed.html");
+    expect(url.searchParams.get("path")).toBe("websockify?token=current-token");
+  });
+
+  it("has no small default cap and accepts optional operator limits", () => {
+    expect(resolveTeamScreenLimit(undefined)).toBeGreaterThan(1000);
+    expect(resolveTeamScreenLimit("0")).toBe(resolveTeamScreenLimit(undefined));
+    expect(resolveTeamScreenLimit("1000")).toBe(1000);
+    expect(resolveTeamScreenLimit("4")).toBe(4);
+    for (const value of ["-1", "1.5", "not-a-number"])
+      expect(() => resolveTeamScreenLimit(value)).toThrow(/positive integer/);
+  });
+
   it("creates a VNC desktop, not an alpine sleep fallback", () => {
     const options = containerCreateOptions({
       name: "rakazo-bot-abc",
@@ -49,31 +68,20 @@ describe("graphical computer spec", () => {
     );
     expect(options.Env).toContain("NPM_CONFIG_PREFIX=/home/rakazo/.local");
     expect(options.Env?.join("\n")).not.toMatch(/AXIOM_|LOG_LEVEL|LOG_FORMAT/);
-    expect(options.ExposedPorts).toMatchObject({
-      "6080/tcp": {},
-      "6081/tcp": {},
-      "6082/tcp": {},
-      "6083/tcp": {},
-      "6084/tcp": {},
-      "6085/tcp": {},
-      "6086/tcp": {},
-      "6087/tcp": {},
-      "6088/tcp": {},
-      "6089/tcp": {},
-      "6090/tcp": {},
-      "6091/tcp": {},
-      "6092/tcp": {},
-      "6093/tcp": {},
-      "6094/tcp": {},
-      "6095/tcp": {},
-    });
+    expect(options.ExposedPorts).toEqual({ "6080/tcp": {} });
+    // Browser debugging stays inside the computer trust boundary.
+    for (let index = 0; index < 1000; index += 1) {
+      const cdpPort = `${screenPorts(index).debugPort}/tcp`;
+      expect(options.ExposedPorts).not.toHaveProperty(cdpPort);
+      expect(options.HostConfig.PortBindings).not.toHaveProperty(cdpPort);
+    }
     expect(options.ExposedPorts).not.toHaveProperty("7070/tcp");
     expect(options.HostConfig.PortBindings).not.toHaveProperty("7070/tcp");
     expect(options.HostConfig.PortBindings["6080/tcp"]?.[0]?.HostIp).toBe("127.0.0.1");
-    expect(options.HostConfig.PortBindings["6081/tcp"]?.[0]?.HostIp).toBe("127.0.0.1");
-    expect(options.HostConfig.PortBindings["6082/tcp"]?.[0]?.HostIp).toBe("127.0.0.1");
-    expect(screenPorts(0)).toMatchObject({ display: ":1", viewPort: "6080", controlPort: "6081" });
-    expect(screenPorts(1)).toMatchObject({ display: ":2", viewPort: "6082", controlPort: "6083" });
+    expect(options.HostConfig.PortBindings).not.toHaveProperty("6081/tcp");
+    expect(options.HostConfig.PortBindings).not.toHaveProperty("6082/tcp");
+    expect(screenPorts(0)).toMatchObject({ display: ":1", viewPort: "6080", controlPort: "6080" });
+    expect(screenPorts(1)).toMatchObject({ display: ":2", viewPort: "6080", controlPort: "6080" });
     expect(options.HostConfig.ShmSize).toBeGreaterThanOrEqual(256 * 1024 * 1024);
     expect(options.User).toBe("1000:1000");
     expect(options.HostConfig.CapDrop).toEqual(["ALL"]);
@@ -133,7 +141,7 @@ describe("graphical computer spec", () => {
     expect(dockerfile).toMatch(/USER 1000:1000/);
     expect(start).toMatch(/rakazo-computer-control/);
     expect(start).toMatch(/rakazo-browser/);
-    expect(start).toMatch(/SingletonLock/);
+    expect(start).not.toMatch(/browser\.log/);
     expect(start).toMatch(/xdg-mime default rakazo-browser\.desktop/);
     expect(start).toMatch(/register_browser_handler x-scheme-handler\/http/);
     expect(start).toMatch(/register_browser_handler x-scheme-handler\/https/);
@@ -145,9 +153,12 @@ describe("graphical computer spec", () => {
     expect(start).not.toMatch(/xdg-mime default rakazo-browser\.desktop .*\|\| true/);
     expect(start).toMatch(/x11vnc .* -viewonly /);
     expect(browser).toMatch(/\.browser-profiles\/chromium/);
-    expect(browser).toMatch(/chromium-screen-\$\{DISPLAY/);
+    expect(browser).toMatch(/chromium-screen-\$DISPLAY_NUM/);
     expect(browser).toMatch(/USER_DATA_DIR_SET/);
+    expect(browser).toMatch(/RAKAZO_BROWSER_PROFILE/);
     expect(desktop).toMatch(/Exec=\/usr\/local\/bin\/rakazo-browser %U/);
+    expect(dockerfile).toMatch(/rakazo-page-browser/);
+    expect(browser).toMatch(/remote-debugging-port/);
     expect(desktop).toMatch(/x-scheme-handler\/http/);
     expect(desktop).toMatch(/x-scheme-handler\/https/);
     expect(start).not.toMatch(/windowsize 1280 800/);
@@ -167,7 +178,7 @@ describe("graphical computer spec", () => {
       chmodSync(chromium, 0o755);
 
       const run = (display: string, args: string[] = []) => {
-        const result = spawnSync("bash", [path.join(root, "rakazo-browser"), ...args], {
+        const result = spawnSync("sh", [path.join(root, "rakazo-browser"), ...args], {
           env: {
             ...process.env,
             DISPLAY: display,
@@ -183,7 +194,16 @@ describe("graphical computer spec", () => {
 
       try {
         expect(run(":1")).toContain(`--user-data-dir=${home}/.browser-profiles/chromium`);
+        expect(run(":1").some((arg) => arg.startsWith("--remote-debugging-port="))).toBe(true);
         expect(run(":2")).toContain(`--user-data-dir=${home}/.browser-profiles/chromium-screen-2`);
+        expect(run(":2")).toContain("--remote-debugging-port=9223");
+        for (const display of [8, 9]) {
+          const args = run(`:0${display}.0`);
+          expect(args).toContain(`--remote-debugging-port=${9221 + display}`);
+          expect(args).toContain(
+            `--user-data-dir=${home}/.browser-profiles/chromium-screen-${display}`,
+          );
+        }
         const explicit = run(":3", [`--user-data-dir=${home}/custom-profile`]);
         expect(explicit).toContain(`--user-data-dir=${home}/custom-profile`);
         expect(explicit).not.toContain(
@@ -354,6 +374,21 @@ describe("graphical computer spec", () => {
     expect(JSON.stringify(options.HostConfig.PortBindings)).not.toMatch(/7070/);
   });
 
+  it("publishes the control port to loopback only when explicitly opted in", () => {
+    const options = containerCreateOptions({
+      name: "rakazo-bot-ctrl",
+      image: COMPUTER_IMAGE,
+      botId: "ctrl",
+      spaceId: "ws",
+      homePath: "/var/rakazo/homes/ctrl",
+      publishControlPort: true,
+    });
+    expect(options.ExposedPorts["7070/tcp"]).toEqual({});
+    expect(options.HostConfig.PortBindings["7070/tcp"]).toEqual([
+      { HostIp: "127.0.0.1", HostPort: "0" },
+    ]);
+  });
+
   it("resolves computer control through the container network IP, never a host mapping", () => {
     const networkMode = "rakazo_default";
     expect(
@@ -384,6 +419,101 @@ describe("graphical computer spec", () => {
         networks: {},
       }),
     ).toBeUndefined();
+  });
+
+  it("resolves computer control through a published loopback port when provided", () => {
+    const networkMode = "rakazo_default";
+    expect(
+      resolveComputerControlEndpoint({
+        token: "secret",
+        networkMode,
+        networks: { [networkMode]: { IPAddress: "172.18.0.4" } },
+        publishedHostPort: "55101",
+      }),
+    ).toEqual({ url: "http://127.0.0.1:55101/v1/desktop", token: "secret" });
+    expect(
+      resolveComputerControlEndpoint({
+        token: undefined,
+        networkMode,
+        networks: { [networkMode]: { IPAddress: "172.18.0.4" } },
+        publishedHostPort: "55101",
+      }),
+    ).toBeUndefined();
+  });
+
+  it.each([undefined, null, {}, { "7070/tcp": null }, { "7070/tcp": [] }])(
+    "recreates unpublished computers only when loopback control is enabled (%j)",
+    (bindings) => {
+      expect(controlPortPublicationMatches(bindings, true)).toBe(false);
+      expect(controlPortPublicationMatches(bindings, false)).toBe(true);
+      expect(publishedLoopbackControlHostPort(bindings)).toBeUndefined();
+    },
+  );
+
+  it.each(["", "0", "55101"])(
+    "accepts configured loopback ports on resume, including unassigned ports (%j)",
+    (HostPort) => {
+      const bindings = { "7070/tcp": [{ HostIp: "127.0.0.1", HostPort }] };
+      expect(controlPortPublicationMatches(bindings, true)).toBe(true);
+      // Opting out must remove existing publication on the next provision.
+      expect(controlPortPublicationMatches(bindings, false)).toBe(false);
+      expect(publishedLoopbackControlHostPort(bindings)).toBe(
+        HostPort === "55101" ? HostPort : undefined,
+      );
+    },
+  );
+
+  it.each(["0.0.0.0", "", "::", "192.0.2.1", undefined])(
+    "rejects external control bindings even alongside loopback (%j)",
+    (HostIp) => {
+      const external = { HostIp, HostPort: "55100" };
+      const loopback = { HostIp: "127.0.0.1", HostPort: "55101" };
+      for (const entries of [[external], [external, loopback], [loopback, external]]) {
+        const bindings = { "7070/tcp": entries };
+        expect(controlPortPublicationMatches(bindings, true)).toBe(false);
+        expect(controlPortPublicationMatches(bindings, false)).toBe(false);
+        expect(publishedLoopbackControlHostPort(bindings)).toBeUndefined();
+      }
+    },
+  );
+
+  it.each([undefined, "-1", "65536", "abc", "55101/other", "80@192.0.2.1"])(
+    "rejects invalid configured and runtime control ports (%j)",
+    (HostPort) => {
+      const bindings = { "7070/tcp": [{ HostIp: "127.0.0.1", HostPort }] };
+      expect(controlPortPublicationMatches(bindings, true)).toBe(false);
+      expect(publishedLoopbackControlHostPort(bindings)).toBeUndefined();
+      expect(
+        resolveComputerControlEndpoint({
+          token: "test-token",
+          networkMode: "bridge",
+          networks: { bridge: { IPAddress: "192.0.2.1" } },
+          publishedHostPort: HostPort,
+          requirePublishedHostPort: true,
+        }),
+      ).toBeUndefined();
+    },
+  );
+
+  it("does not fall back to the container IP when a published control port is required", () => {
+    const networkMode = "rakazo_default";
+    expect(
+      resolveComputerControlEndpoint({
+        token: "secret",
+        networkMode,
+        networks: { [networkMode]: { IPAddress: "172.18.0.4" } },
+        requirePublishedHostPort: true,
+      }),
+    ).toBeUndefined();
+    expect(
+      resolveComputerControlEndpoint({
+        token: "secret",
+        networkMode,
+        networks: { [networkMode]: { IPAddress: "172.18.0.4" } },
+        publishedHostPort: "55101",
+        requirePublishedHostPort: true,
+      }),
+    ).toEqual({ url: "http://127.0.0.1:55101/v1/desktop", token: "secret" });
   });
 
   it("restricts computer control argv to supervisor shapes", () => {
@@ -511,11 +641,11 @@ describe("computer resource limits", () => {
     name: "rakazo-bot-x",
     image: "rakazo/computer:local",
     botId: "bot-x",
-    spaceId: "ws-1",
-    homePath: "/data/homes/bot-x",
+    spaceId: "ws",
+    homePath: "/var/rakazo/homes/bot-x",
   };
 
-  it("caps memory, cpu and pids on every computer by default", () => {
+  it("caps memory and cpu by default and keeps #343's pids ceiling", () => {
     const { HostConfig } = containerCreateOptions(createInput);
     expect(HostConfig.Memory).toBe(2 * 1024 ** 3);
     expect(HostConfig.MemorySwap).toBe(HostConfig.Memory);
@@ -555,7 +685,14 @@ describe("computer resource limits", () => {
     expect(() => containerCreateOptions(createInput)).toThrow(/RAKAZO_COMPUTER_CPUS/);
   });
 
+  it("rejects a pids limit that is not a positive integer", () => {
+    process.env.RAKAZO_COMPUTER_PIDS_LIMIT = "12.5";
+    expect(() => containerCreateOptions(createInput)).toThrow(/RAKAZO_COMPUTER_PIDS_LIMIT/);
+  });
+
   it("rejects a memory limit below Docker's 6 MiB minimum", () => {
+    // The daemon refuses these at container creation, so accepting them here would turn a typo
+    // into a 500 on the first bot rather than a startup failure naming the variable.
     for (const value of ["1", "1m", "5m", "5242880"]) {
       process.env.RAKAZO_COMPUTER_MEMORY = value;
       expect(() => containerCreateOptions(createInput)).toThrow(/RAKAZO_COMPUTER_MEMORY/);
@@ -565,66 +702,25 @@ describe("computer resource limits", () => {
   });
 
   it("rejects a CPU count that would floor to Docker's unlimited", () => {
-    // Math.floor(1e-10 * 1e9) is 0, and 0 NanoCpus means uncapped.
+    // Math.floor(1e-10 * 1e9) is 0, and 0 NanoCpus means uncapped. An accepted value must never
+    // turn a ceiling into no ceiling.
     process.env.RAKAZO_COMPUTER_CPUS = "0.0000000001";
     expect(() => containerCreateOptions(createInput)).toThrow(/RAKAZO_COMPUTER_CPUS/);
   });
 
-  it("keeps #343's hardening alongside the configured ceilings", () => {
-    const { HostConfig } = containerCreateOptions(createInput);
-    expect(HostConfig.CapDrop).toEqual(["ALL"]);
-    expect(HostConfig.SecurityOpt).toEqual(["no-new-privileges:true"]);
-    expect(HostConfig.PidsLimit).toBe(2048);
+  it("rejects a CPU count that leaves the safe-integer NanoCpus range", () => {
+    // 1e300 is finite, but Math.floor(1e300 * 1e9) is Infinity. 1e7 CPUs yields a non-safe
+    // integer. Both must fail closed rather than reach HostConfig.NanoCpus.
+    for (const value of ["1e300", "10000000"]) {
+      process.env.RAKAZO_COMPUTER_CPUS = value;
+      expect(() => containerCreateOptions(createInput)).toThrow(/RAKAZO_COMPUTER_CPUS/);
+    }
   });
 
   it("parses byte counts without a unit suffix", () => {
     expect(parseMemoryBytes("X", "1073741824")).toBe(1024 ** 3);
   });
 });
-
-describe("computer screen bind host", () => {
-  const ENV = "RAKAZO_COMPUTER_BIND_HOST";
-  let saved: string | undefined;
-
-  beforeEach(() => {
-    saved = process.env[ENV];
-    delete process.env[ENV];
-    vi.resetModules();
-  });
-
-  afterEach(() => {
-    if (saved === undefined) delete process.env[ENV];
-    else process.env[ENV] = saved;
-    vi.resetModules();
-  });
-
-  it("binds the screen to loopback by default", async () => {
-    const { computerPortBindings } = await import("./computer-spec.js");
-    const { PortBindings } = computerPortBindings();
-    for (const bindings of Object.values(PortBindings)) {
-      for (const b of bindings) expect(b.HostIp).toBe("127.0.0.1");
-    }
-  });
-
-  it("binds where sibling containers can reach when configured", async () => {
-    process.env[ENV] = "172.17.0.1";
-    vi.resetModules();
-    const { computerPortBindings } = await import("./computer-spec.js");
-    const { PortBindings } = computerPortBindings();
-    const hosts = new Set(Object.values(PortBindings).flatMap((bs) => bs.map((b) => b.HostIp)));
-    expect([...hosts]).toEqual(["172.17.0.1"]);
-  });
-
-  it("publishes both the view and control port for every screen", async () => {
-    process.env[ENV] = "172.17.0.1";
-    vi.resetModules();
-    const { computerPortBindings, TEAM_SCREEN_LIMIT } = await import("./computer-spec.js");
-    const { PortBindings, ExposedPorts } = computerPortBindings();
-    expect(Object.keys(PortBindings)).toHaveLength(TEAM_SCREEN_LIMIT * 2);
-    expect(Object.keys(ExposedPorts)).toHaveLength(TEAM_SCREEN_LIMIT * 2);
-  });
-});
-
 describe("computer extra mounts", () => {
   it("adds nothing when unset, leaving the workspace bind alone", () => {
     expect(computerExtraMounts(undefined)).toEqual([]);

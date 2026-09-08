@@ -1,0 +1,8 @@
+# Synthetic fixtures in upstream's own eval harness, not credentials. Both files
+# are byte-identical to upstream main; the values name themselves as synthetic
+# and exist so the harness can boot a throwaway app against a temporary database.
+# These fingerprints are line-pinned on purpose: if upstream moves the lines the
+# entry stops matching and the scanner flags them again, which is the safe way
+# for this to rot.
+packages/testkit/src/cli/evals.ts:generic-api-key:106
+packages/testkit/src/evals/evals.test.ts:generic-api-key:389

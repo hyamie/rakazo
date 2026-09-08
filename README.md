@@ -14,7 +14,7 @@ Rakazo is in beta. Learn more at [rakazo.com](https://rakazo.com).
 ## Features
 
 - Persistent bots with their own conversations, memory, routines, and history
-- Voice mode: speak replies, dictate, and call a bot. Bring your own ElevenLabs, OpenAI, or Cartesia key
+- Voice mode: speak replies, dictate, and call a bot. Bring your own ElevenLabs, OpenAI, Cartesia, or Fish Audio key
 - Shared Team Computers and isolated Private computers
 - Browser, terminal, file, and graphical desktop access
 - Bots that can delegate to peer bots or short-lived subagents
@@ -83,7 +83,8 @@ the `https://` address.
 
 ## Local development (source checkout)
 
-You need Node.js 22+, pnpm 9, and Docker.
+You need Node.js 22.22.2 or newer in the 22.x line, Node.js 24.x, or Node.js 26+;
+pnpm 9; and Docker. Node.js 23.x and 25.x are not supported.
 
 ```bash
 git clone https://github.com/elie222/rakazo.git
@@ -151,15 +152,13 @@ Mobile build and release instructions live in [docs/mobile-release.md](./docs/mo
 ## UI language
 
 The web (and Electron-hosted) UI supports English, Deutsch, 한국어, Türkçe, हिन्दी,
-Português (Brasil), and 简体中文 under **Settings → Language**. The Expo app supports
-English and 简体中文 under **Account → Language**. The marketing homepage (`apps/www`) is
-available in en/de/ko/zh via footer language links (`/`, `/de/`, `/ko/`, `/zh/`); other
-marketing pages stay English.
+Português (Brasil), 简体中文, Español, and Русский under **Settings → Language**. The Expo
+app supports English, 简体中文, and Русский under **Account → Language**. The marketing
+homepage (`apps/www`) is available in en/de/ko/zh via footer language links (`/`, `/de/`,
+`/ko/`, `/zh/`); other marketing pages stay English. The Russian marketing homepage and
+native Electron setup/menu remain separate follow-up work.
 
 ## Development
-
-Rakazo is a TypeScript monorepo built with React, Electron, Expo, Hono, Postgres, Prisma, Graphile
-Worker, and Pi.
 
 ```text
 apps/       web, api, worker, desktop, mobile, and public website
@@ -182,20 +181,8 @@ See [CONTRIBUTING.md](./CONTRIBUTING.md) for the development workflow and test m
 
 ## Documentation
 
-```bash
-pnpm test              # unit, property, and in-process contract tests
-pnpm test:integration  # Postgres journeys, Graphile jobs, LISTEN/NOTIFY
-pnpm test:e2e          # Playwright against the emulated stack
-pnpm test:e2e -- --sandbox=e2b # the same deterministic suite against real E2B
-pnpm test:e2e -- --sandbox=daytona # the same suite against real Daytona
-pnpm test:e2e -- --sandbox=box # the same suite against real Box
-pnpm test:topology     # local Docker + Graphile worker recovery (needs Docker)
-pnpm test:canary       # live OpenRouter / E2B / Box canaries
-# explicit real vision-model + real E2B desktop acceptance test:
-COMPUTER_E2E_MODEL=<vision-capable-openrouter-model-id> pnpm test:computer
-```
-
 - [Self-hosting](./docs/self-host.md)
+- [Self-host secrets](./docs/self-host-secrets.md)
 - [Computer runtime and isolation](./docs/computer-runtime.md)
 - [Desktop releases](./docs/desktop-release.md)
 - [Mobile releases](./docs/mobile-release.md)
@@ -203,9 +190,6 @@ COMPUTER_E2E_MODEL=<vision-capable-openrouter-model-id> pnpm test:computer
 
 ## Contributing
 
-The Playwright workflow can also be started manually with **Sandbox provider** set to `e2b`, `daytona`, or `box`.
-Those options require `E2B_API_KEY`, `DAYTONA_API_KEY`, or `BOX_API_KEY`, keep the deterministic scripted agent runtime, and destroy
-the provider machines after the run. The default and all automatic runs remain on `fake`.
 Contributions are welcome. Please read [CONTRIBUTING.md](./CONTRIBUTING.md) before opening a pull
 request. For security vulnerabilities, follow [SECURITY.md](./SECURITY.md) instead of filing a public
 issue.

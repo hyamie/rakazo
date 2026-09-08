@@ -51,6 +51,23 @@ describe("appearance preference", () => {
     }
   });
 
+  it("keeps user message surfaces muted, not cream invert", () => {
+    const dark = tokensForAppearance("dark");
+    const light = tokensForAppearance("light");
+    expect(dark.secondary).not.toBe(dark.primary);
+    expect(light.secondary).not.toBe(light.primary);
+    expect(dark.secondaryForeground).not.toBe(dark.primaryForeground);
+  });
+
+  it("separates user bubbles from bot bubbles and the sidebar from the app", () => {
+    const dark = tokensForAppearance("dark");
+    const light = tokensForAppearance("light");
+    expect(dark.chatUser).not.toBe(dark.muted);
+    expect(light.chatUser).not.toBe(light.muted);
+    expect(dark.sidebar).not.toBe(dark.background);
+    expect(light.sidebar).not.toBe(light.background);
+  });
+
   it("tolerates a throwing localStorage getter", () => {
     const desc = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
     Object.defineProperty(globalThis, "localStorage", {
