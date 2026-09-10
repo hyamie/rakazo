@@ -47,7 +47,13 @@ IP="${IP_CIDR%/*}"
 SSH_AUTHORIZED_KEY="$(head -n1 "$SSH_KEY_FILE")"
 [[ "$SSH_AUTHORIZED_KEY" == ssh-* ]] || die "$SSH_KEY_FILE does not look like a public key"
 
-node() { ssh -o BatchMode=yes "root@${NODE}" "$@"; }
+# One SSH connection for every call below, including the guest-agent poll.
+CONTROL_DIR="$(mktemp -d)"
+trap 'ssh -o ControlPath="$CONTROL_DIR/cm" -O exit "root@${NODE}" 2>/dev/null; rm -rf "$CONTROL_DIR"' EXIT
+node() {
+  ssh -o BatchMode=yes -o ControlMaster=auto -o ControlPath="$CONTROL_DIR/cm" -o ControlPersist=60 \
+    "root@${NODE}" "$@"
+}
 
 # Probe the address from the node, never from this workstation: a macvtap guest
 # cannot talk to its own host, so a probe from a hypervisor host is blind to that
