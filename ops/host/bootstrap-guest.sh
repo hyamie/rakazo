@@ -53,6 +53,10 @@ if [[ ! -f "$CHECKOUT/.env" ]]; then
   [[ -t 0 ]] && die "pipe the model gateway API key on stdin"
   IFS= read -r MODEL_KEY || true
   [[ -n "$MODEL_KEY" ]] || die "empty model gateway API key on stdin"
+  # The key is written into the generated .env as a single-quoted value, which is
+  # what stops Compose interpolating a $ in it. A single quote in the key itself
+  # cannot be represented inside that form, so refuse it rather than mangle it.
+  [[ "$MODEL_KEY" != *"'"* ]] || die "the model gateway API key contains a single quote, which cannot be written to .env"
 fi
 
 # Everything this script writes into .env. The vars file may not set any of these
@@ -88,7 +92,7 @@ WAKEUP_DRIVER=graphile
 RAKAZO_IMAGE_TAG=local
 RAKAZO_UPDATER_URL=
 GIT_SHA=
-RAKAZO_LOCAL_MODELS_API_KEY=${MODEL_KEY}
+RAKAZO_LOCAL_MODELS_API_KEY='${MODEL_KEY}'
 EOF
 )"
 while IFS= read -r key; do

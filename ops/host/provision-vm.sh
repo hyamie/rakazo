@@ -48,6 +48,12 @@ done
 [[ "$NAME" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] || die "--name must be a valid hostname label"
 [[ "$IP_CIDR" == */* ]] || die "--ip needs a prefix length, for example 192.0.2.10/24"
 [[ -f "$SSH_KEY_FILE" ]] || die "no such key file: $SSH_KEY_FILE"
+# These three reach the node inside single-quoted shell snippets, so a quote in
+# any of them would end the quoting and the rest would be interpreted there.
+[[ -z "$VMID" || "$VMID" =~ ^[0-9]+$ ]] || die "--vmid must be a number"
+[[ "$STORAGE" =~ ^[A-Za-z0-9._-]+$ ]] || die "--storage must be a plain storage id"
+[[ "$IMAGE" == /* && "$IMAGE" != *["'"'"'"$'\n'"]* ]] \
+  || die "--image must be an absolute path with no quote or newline"
 NAMESERVER="${NAMESERVER:-$GATEWAY}"
 IP="${IP_CIDR%/*}"
 SSH_AUTHORIZED_KEY="$(head -n1 "$SSH_KEY_FILE")"
@@ -64,36 +70,51 @@ esac
 # One SSH connection for every call below, including the guest-agent poll.
 CONTROL_DIR="$(mktemp -d)"
 trap 'ssh -o ControlPath="$CONTROL_DIR/cm" -O exit "root@${NODE}" 2>/dev/null; rm -rf "$CONTROL_DIR"' EXIT
-node() {
+# Run a shell snippet on the node. Whatever is interpolated into the snippet is
+# interpreted by the node's shell, so it has to be quoted for that shell here.
+node_sh() {
   ssh -o BatchMode=yes -o ControlMaster=auto -o ControlPath="$CONTROL_DIR/cm" -o ControlPersist=60 \
     "root@${NODE}" "$@"
+}
+
+# Quote one argument for a POSIX shell. Not printf %q: that emits bash's $'...'
+# form for some inputs, which the node's shell may not be.
+shq() { printf "'%s'" "${1//\'/\'\\\'\'}"; }
+
+# Run one command on the node with its argument boundaries intact. ssh joins argv
+# with spaces and hands the result to the remote shell, so local quoting is lost
+# unless each argument carries its own.
+node_run() {
+  local quoted="" arg
+  for arg in "$@"; do quoted+=" $(shq "$arg")"; done
+  node_sh "$quoted"
 }
 
 # Probe the address from the node, never from this workstation: a macvtap guest
 # cannot talk to its own host, so a probe from a hypervisor host is blind to that
 # host's guests. The node sits on the same segment the new VM will join.
-if node "ping -c1 -W1 '$IP' >/dev/null 2>&1 || ip neigh show '$IP' | grep -Eq 'lladdr .* (REACHABLE|STALE|DELAY|PERMANENT)'"; then
+if node_sh "ping -c1 -W1 '$IP' >/dev/null 2>&1 || ip neigh show '$IP' | grep -Eq 'lladdr .* (REACHABLE|STALE|DELAY|PERMANENT)'"; then
   die "$IP is answering on the node's segment; pick a free address"
 fi
 
 [[ -n "$VMID" ]] || VMID="$(node pvesh get /cluster/nextid)"
-if node "qm status '$VMID'" >/dev/null 2>&1; then
+if node_sh "qm status '$VMID'" >/dev/null 2>&1; then
   die "VMID $VMID already exists"
 fi
 [[ "$IMAGE_SHA512" =~ ^[0-9a-fA-F]{128}$ ]] \
   || die "--image-sha512 is required and must be 128 hex characters, from the publisher's SHA512SUMS"
-node "test -f '$IMAGE'" || die "image not found on the node: $IMAGE"
+node_sh "test -f '$IMAGE'" || die "image not found on the node: $IMAGE"
 # Verify on the node, against the file qm create will actually import.
-node "printf '%s  %s\\n' '$IMAGE_SHA512' '$IMAGE' | sha512sum -c --status -" \
+node_sh "printf '%s  %s\\n' '$IMAGE_SHA512' '$IMAGE' | sha512sum -c --status -" \
   || die "image on the node does not match --image-sha512: $IMAGE"
 
 SNIPPET="${NAME}-user-data.yaml"
 # shellcheck disable=SC2016  # envsubst must receive the names unexpanded
 VM_HOSTNAME="$NAME" SSH_AUTHORIZED_KEY="$SSH_AUTHORIZED_KEY" \
   envsubst '${VM_HOSTNAME} ${SSH_AUTHORIZED_KEY}' < "$HERE/cloud-init.yaml" \
-  | node "install -d -m 755 /var/lib/vz/snippets && cat > '/var/lib/vz/snippets/$SNIPPET'"
+  | node_sh "install -d -m 755 /var/lib/vz/snippets && cat > '/var/lib/vz/snippets/$SNIPPET'"
 
-node qm create "$VMID" \
+node_run qm create "$VMID" \
   --name "$NAME" \
   --ostype l26 \
   --cpu x86-64-v3 \
@@ -111,12 +132,12 @@ node qm create "$VMID" \
   --nameserver "$NAMESERVER" \
   --cicustom "user=local:snippets/${SNIPPET}"
 
-node qm disk resize "$VMID" scsi0 "${DISK_GB}G"
-node qm start "$VMID"
+node_run qm disk resize "$VMID" scsi0 "${DISK_GB}G"
+node_run qm start "$VMID"
 
 agent_up=""
 for _ in $(seq 1 60); do
-  if node "qm agent '$VMID' ping" >/dev/null 2>&1; then
+  if node_sh "qm agent '$VMID' ping" >/dev/null 2>&1; then
     agent_up=1
     break
   fi
@@ -130,7 +151,7 @@ done
 # the rest of the package list, so returning here would hand the operator a guest
 # whose apt lock is still held and make the bootstrap's install fail at random.
 # The sentinel is what is checked, not the JSON qm wraps the output in.
-node "qm guest exec '$VMID' --timeout 900 -- /bin/sh -c 'cloud-init status --wait >/dev/null 2>&1 && echo CLOUD_INIT_DONE'" \
+node_sh "qm guest exec '$VMID' --timeout 900 -- /bin/sh -c 'cloud-init status --wait >/dev/null 2>&1 && echo CLOUD_INIT_DONE'" \
   | grep -q CLOUD_INIT_DONE \
   || die "VM $VMID came up but cloud-init did not finish cleanly; check 'qm guest exec $VMID -- cloud-init status --long'"
 
