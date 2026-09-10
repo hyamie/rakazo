@@ -68,7 +68,9 @@ BETTER_AUTH_SECRET=$(openssl rand -hex 32)
 ENCRYPTION_KEY=$(openssl rand -hex 32)
 SANDBOX_SUPERVISOR_TOKEN=$(openssl rand -hex 32)
 SCREEN_PROXY_SECRET=$(openssl rand -hex 32)
-# Closed until the operator names the first account's address.
+# Signup policy only seeds the api's first start; after that the stored deployment
+# settings are authoritative and editing these lines changes nothing. An allowlist
+# without email delivery refuses every signup.
 SIGNUPS_ENABLED=false
 SIGNUP_ALLOWLIST=
 SANDBOX_PROVIDER=docker
