@@ -357,3 +357,45 @@ container's config hash off the rendered service definition, and an edit to
 container on the old file. That is not hypothetical: Caddy sat on the upstream
 Caddyfile through a redeploy and kept retrying ACME for `app.example.com` while
 `.env` had already been corrected.
+
+## Setting the login password
+
+`/usr/local/sbin/rakazo-setpw` on the deployment host sets the account password
+from a value on **stdin**. The value is never an argument and never written to
+disk, so it stays out of `ps` and out of shell history:
+
+```
+<read the password from your secret store> \
+  | ssh <deployment-host> sudo /usr/local/sbin/rakazo-setpw
+```
+
+Pipe it in rather than passing it as an argument, and do not echo it into a
+prompt string: anything inside the quotes of a `read -p` is printed and lands in
+shell history.
+
+It hashes with better-auth's own `hashPassword`, round-trip verifies the result,
+and only writes the row if that check passes. A hash this build cannot verify
+would lock the account out, which is the failure the check exists to prevent.
+
+This exists because self-service recovery is unavailable here:
+`sendResetPassword` and `sendVerificationEmail` are both gated on a configured
+email transport, and this deployment has none, so `/api/auth/forget-password`
+returns 404.
+
+Writing the row directly also bypasses better-auth's reset flow, so
+`revokeSessionsOnPasswordReset` does not fire and existing sessions survive.
+
+### Email verification can lock the account out
+
+`requireEmailVerification` is on whenever a signup allowlist is configured, and
+this deployment sets one. With no email transport there is no way to ever
+verify, so an account with `emailVerified = false` is permanently refused at
+sign-in with **"Email not verified"** and no recoverable path. If that happens:
+
+```sql
+update "user" set "emailVerified" = true where "emailVerified" = false;
+```
+
+The sign-in page reports this distinctly from a bad password. Read the screen
+before diagnosing from server logs, which show the rejection but not the reason
+the user was given.
