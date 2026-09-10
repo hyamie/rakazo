@@ -1,0 +1,42 @@
+# Edge for a deployment served on one LAN address, with no public DNS name.
+#
+# The same file serves any such deployment: Caddy substitutes {$RAKAZO_HOST} from
+# the environment at load time, and the prod compose file already passes
+# RAKAZO_HOST to the caddy service. Point CADDYFILE_PATH at a copy of this file.
+# ops/compose/Caddyfile.lan explains each setting below in full; in short:
+#
+# - local_certs: there is no public name to issue for, and Better Auth cookies
+#   must not cross the LAN in clear.
+# - protocols h1 h2: a manually accepted certificate exception does not carry
+#   over to HTTP/3, so individual fetches fail with a bare "Failed to fetch".
+# - default_sni: a browser sends no SNI for an IP literal, and without a default
+#   the TLS handshake hangs instead of failing.
+{
+	local_certs
+
+	servers {
+		protocols h1 h2
+	}
+
+	default_sni {$RAKAZO_HOST}
+}
+
+https://{$RAKAZO_HOST} {
+	encode zstd gzip
+
+	handle /health {
+		reverse_proxy api:3100
+	}
+
+	handle /api/* {
+		reverse_proxy api:3100
+	}
+
+	handle /rpc/* {
+		reverse_proxy api:3100
+	}
+
+	handle {
+		reverse_proxy web:5173
+	}
+}
