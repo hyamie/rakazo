@@ -14,13 +14,18 @@
 #               unconditionally, so it must be a real file even with no MCP server using it
 #   stdin       the model gateway API key, kept off the command line
 #
+# Environment:
+#   RAKAZO_FORK         required, the `owner/repo` the checkout is cloned from
+#   RAKAZO_BASE_BRANCH  branch to clone, default deploy/hds
+#
 # Safe to re-run: it never overwrites an existing .env or checkout.
 set -euo pipefail
 
 HOST="" VARS="" CA_CERT=""
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# Same overridable defaults as ops/sync-upstream.sh.
-RAKAZO_FORK="${RAKAZO_FORK:-hyamie/rakazo}"
+# The fork is required rather than defaulted: this file is public, so it must not
+# name an account, and a wrong default would silently clone somebody else's tree.
+RAKAZO_FORK="${RAKAZO_FORK:-}"
 RAKAZO_BASE_BRANCH="${RAKAZO_BASE_BRANCH:-deploy/hds}"
 CHECKOUT=/opt/rakazo
 LOCAL_DIR=/opt/rakazo-local
@@ -39,6 +44,8 @@ done
 
 [[ $EUID -eq 0 ]] || die "run as root"
 [[ -n "$HOST" && -f "$VARS" && -f "$CA_CERT" ]] || die "--host, --vars <file> and --ca-cert <file> are required"
+[[ "$RAKAZO_FORK" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] \
+  || die "set RAKAZO_FORK to the owner/repo to clone, for example RAKAZO_FORK=acme/rakazo"
 id rakazo >/dev/null 2>&1 || die "user rakazo is missing; was the guest built from cloud-init.yaml?"
 
 MODEL_KEY=""
@@ -113,6 +120,7 @@ if ! command -v docker >/dev/null 2>&1; then
   install -d -m 755 /etc/apt/keyrings
   curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc
   chmod 644 /etc/apt/keyrings/docker.asc
+  # shellcheck source=/dev/null
   codename="$(. /etc/os-release && echo "$VERSION_CODENAME")"
   echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian ${codename} stable" \
     > /etc/apt/sources.list.d/docker.list

@@ -9,10 +9,15 @@
 #   provision-vm.sh --node <address> --name <vm-name> --ip <addr/prefix> \
 #     --gateway <addr> --ssh-key-file <file.pub> [--nameserver <addr>] \
 #     [--vmid <id>] [--cores 4] [--memory-mb 8192] [--disk-gb 100] \
-#     [--storage vmdata] [--image /var/lib/vz/template/iso/debian-13-genericcloud-amd64.qcow2]
+#     --image-sha512 <128 hex> [--storage vmdata] \
+#     [--image /var/lib/vz/template/iso/debian-13-genericcloud-amd64.qcow2]
+#
+# --image-sha512 is the digest from the image publisher's own SHA512SUMS. It is
+# required: this image becomes the guest OS, and an existence check accepts a
+# truncated download or a file somebody replaced on the node after it landed.
 set -euo pipefail
 
-NODE="" NAME="" IP_CIDR="" GATEWAY="" NAMESERVER="" SSH_KEY_FILE="" VMID=""
+NODE="" NAME="" IP_CIDR="" GATEWAY="" NAMESERVER="" SSH_KEY_FILE="" VMID="" IMAGE_SHA512=""
 CORES=4 MEMORY_MB=8192 DISK_GB=100 STORAGE=vmdata
 IMAGE=/var/lib/vz/template/iso/debian-13-genericcloud-amd64.qcow2
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -33,6 +38,7 @@ while [[ $# -gt 0 ]]; do
     --disk-gb) DISK_GB="$2"; shift 2 ;;
     --storage) STORAGE="$2"; shift 2 ;;
     --image) IMAGE="$2"; shift 2 ;;
+    --image-sha512) IMAGE_SHA512="$2"; shift 2 ;;
     *) die "unknown argument: $1" ;;
   esac
 done
@@ -46,6 +52,11 @@ NAMESERVER="${NAMESERVER:-$GATEWAY}"
 IP="${IP_CIDR%/*}"
 SSH_AUTHORIZED_KEY="$(head -n1 "$SSH_KEY_FILE")"
 [[ "$SSH_AUTHORIZED_KEY" == ssh-* ]] || die "$SSH_KEY_FILE does not look like a public key"
+# The key is rendered into a double-quoted YAML scalar, where a quote or a
+# backslash in the free-form comment would end or escape past the scalar.
+case "$SSH_AUTHORIZED_KEY" in
+  *[\"\\]*) die "$SSH_KEY_FILE has a quote or backslash in its comment; strip it" ;;
+esac
 
 # One SSH connection for every call below, including the guest-agent poll.
 CONTROL_DIR="$(mktemp -d)"
@@ -66,9 +77,15 @@ fi
 if node "qm status '$VMID'" >/dev/null 2>&1; then
   die "VMID $VMID already exists"
 fi
+[[ "$IMAGE_SHA512" =~ ^[0-9a-fA-F]{128}$ ]] \
+  || die "--image-sha512 is required and must be 128 hex characters, from the publisher's SHA512SUMS"
 node "test -f '$IMAGE'" || die "image not found on the node: $IMAGE"
+# Verify on the node, against the file qm create will actually import.
+node "printf '%s  %s\\n' '$IMAGE_SHA512' '$IMAGE' | sha512sum -c --status -" \
+  || die "image on the node does not match --image-sha512: $IMAGE"
 
 SNIPPET="${NAME}-user-data.yaml"
+# shellcheck disable=SC2016  # envsubst must receive the names unexpanded
 VM_HOSTNAME="$NAME" SSH_AUTHORIZED_KEY="$SSH_AUTHORIZED_KEY" \
   envsubst '${VM_HOSTNAME} ${SSH_AUTHORIZED_KEY}' < "$HERE/cloud-init.yaml" \
   | node "install -d -m 755 /var/lib/vz/snippets && cat > '/var/lib/vz/snippets/$SNIPPET'"
