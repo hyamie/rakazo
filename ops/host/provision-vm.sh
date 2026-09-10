@@ -51,7 +51,10 @@ done
 NAMESERVER="${NAMESERVER:-$GATEWAY}"
 IP="${IP_CIDR%/*}"
 SSH_AUTHORIZED_KEY="$(head -n1 "$SSH_KEY_FILE")"
-[[ "$SSH_AUTHORIZED_KEY" == ssh-* ]] || die "$SSH_KEY_FILE does not look like a public key"
+# Ask OpenSSH, rather than matching a name prefix: ecdsa-sha2-* and the
+# sk-* hardware-backed types are valid public keys that no ssh-* prefix matches.
+ssh-keygen -l -f /dev/stdin <<<"$SSH_AUTHORIZED_KEY" >/dev/null 2>&1 \
+  || die "the first line of $SSH_KEY_FILE is not a public key OpenSSH recognises"
 # The key is rendered into a double-quoted YAML scalar, where a quote or a
 # backslash in the free-form comment would end or escape past the scalar.
 case "$SSH_AUTHORIZED_KEY" in
@@ -111,11 +114,24 @@ node qm create "$VMID" \
 node qm disk resize "$VMID" scsi0 "${DISK_GB}G"
 node qm start "$VMID"
 
+agent_up=""
 for _ in $(seq 1 60); do
   if node "qm agent '$VMID' ping" >/dev/null 2>&1; then
-    echo "VM $VMID ($NAME) is up at $IP"
-    exit 0
+    agent_up=1
+    break
   fi
   sleep 5
 done
-die "VM $VMID started but the guest agent did not answer within 5 minutes; check 'qm terminal $VMID'"
+[[ -n "$agent_up" ]] \
+  || die "VM $VMID started but the guest agent did not answer within 5 minutes; check 'qm terminal $VMID'"
+
+# An answering agent is not a ready guest. qemu-guest-agent's own package can be
+# installed, and its service started, while cloud-final is still working through
+# the rest of the package list, so returning here would hand the operator a guest
+# whose apt lock is still held and make the bootstrap's install fail at random.
+# The sentinel is what is checked, not the JSON qm wraps the output in.
+node "qm guest exec '$VMID' --timeout 900 -- /bin/sh -c 'cloud-init status --wait >/dev/null 2>&1 && echo CLOUD_INIT_DONE'" \
+  | grep -q CLOUD_INIT_DONE \
+  || die "VM $VMID came up but cloud-init did not finish cleanly; check 'qm guest exec $VMID -- cloud-init status --long'"
+
+echo "VM $VMID ($NAME) is up at $IP and cloud-init has finished"
