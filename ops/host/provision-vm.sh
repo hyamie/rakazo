@@ -116,9 +116,13 @@ node_run sh -c 'printf "%s  %s\n" "$1" "$2" | sha512sum -c --status -' _ "$IMAGE
   || die "image on the node does not match --image-sha512: $IMAGE"
 
 SNIPPET="${NAME}-user-data.yaml"
-# shellcheck disable=SC2016  # envsubst must receive the names unexpanded
-VM_HOSTNAME="$NAME" SSH_AUTHORIZED_KEY="$SSH_AUTHORIZED_KEY" \
-  envsubst '${VM_HOSTNAME} ${SSH_AUTHORIZED_KEY}' < "$HERE/cloud-init.yaml" \
+# Rendered in bash rather than with envsubst, which macOS does not ship. The
+# replacement values are quoted so an & in the key's comment stays literal.
+USER_DATA="$(<"$HERE/cloud-init.yaml")"
+USER_DATA="${USER_DATA//\$\{VM_HOSTNAME\}/"$NAME"}"
+USER_DATA="${USER_DATA//\$\{SSH_AUTHORIZED_KEY\}/"$SSH_AUTHORIZED_KEY"}"
+# shellcheck disable=SC2016  # $1 is for the node's sh, not this one
+printf '%s\n' "$USER_DATA" \
   | node_run sh -c 'install -d -m 755 /var/lib/vz/snippets && cat > "/var/lib/vz/snippets/$1"' _ "$SNIPPET"
 
 node_run qm create "$VMID" \
