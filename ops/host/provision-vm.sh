@@ -115,6 +115,11 @@ node_run test -f "$IMAGE" || die "image not found on the node: $IMAGE"
 node_run sh -c 'printf "%s  %s\n" "$1" "$2" | sha512sum -c --status -' _ "$IMAGE_SHA512" "$IMAGE" \
   || die "image on the node does not match --image-sha512: $IMAGE"
 
+# qm rejects a cicustom reference unless the storage advertises snippet content;
+# the directory existing is not enough.
+node_run pvesm status --content snippets | awk 'NR > 1 && $1 == "local"' | grep -q . \
+  || die "storage 'local' on the node does not allow snippets; add the type with: pvesm set local --content <its current list>,snippets"
+
 SNIPPET="${NAME}-user-data.yaml"
 # Rendered in bash rather than with envsubst, which macOS does not ship. The
 # replacement values are quoted so an & in the key's comment stays literal.

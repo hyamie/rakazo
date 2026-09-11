@@ -80,9 +80,12 @@ ENCRYPTION_KEY=$(openssl rand -hex 32)
 SANDBOX_SUPERVISOR_TOKEN=$(openssl rand -hex 32)
 SCREEN_PROXY_SECRET=$(openssl rand -hex 32)
 # Signup policy only seeds the api's first start; after that the stored deployment
-# settings are authoritative and editing these lines changes nothing. An allowlist
-# without email delivery refuses every signup.
-SIGNUPS_ENABLED=false
+# settings are authoritative and editing these lines changes nothing. Registration
+# starts open because a fresh guest has no accounts and signing up is the only way
+# to create the owner; close it once that account exists by setting
+# deployment_settings.signupsEnabled to false. An allowlist without email delivery
+# refuses every signup.
+SIGNUPS_ENABLED=true
 SIGNUP_ALLOWLIST=
 SANDBOX_PROVIDER=docker
 SANDBOX_SUPERVISOR_URL=http://supervisor:7091
@@ -164,4 +167,4 @@ install -m 644 "$CHECKOUT/infra/systemd/rakazo-backup.timer" /etc/systemd/system
 systemctl daemon-reload
 systemctl enable --now rakazo-backup.timer
 
-echo "Guest ready. Next: sudo -u rakazo ${CHECKOUT}/ops/deploy.sh up"
+echo "Guest ready. Next: sudo -u rakazo ${CHECKOUT}/ops/deploy.sh up, sign up the owner account, then close registration"
