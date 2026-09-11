@@ -1332,9 +1332,14 @@ function jsonField(spec: unknown): ReturnType<typeof Type.String> {
 // enough for a full email thread as HTML and never less than a useful page.
 const TOOL_RESULT_MAX_CHARS = 48_000;
 const TOOL_RESULT_MIN_CHARS = 4_000;
+// A model that does not declare its window keeps the bound the runtime always had.
+const TOOL_RESULT_DEFAULT_CHARS = 12_000;
 
-export function toolResultCharBudget(contextWindow: number): number {
-  const share = Math.floor(contextWindow / 8) * 4;
+export function toolResultCharBudget(contextWindow: number | undefined): number {
+  if (!Number.isFinite(contextWindow) || (contextWindow as number) <= 0) {
+    return TOOL_RESULT_DEFAULT_CHARS;
+  }
+  const share = Math.floor((contextWindow as number) / 8) * 4;
   return Math.min(TOOL_RESULT_MAX_CHARS, Math.max(TOOL_RESULT_MIN_CHARS, share));
 }
 

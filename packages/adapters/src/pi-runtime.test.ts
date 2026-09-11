@@ -97,6 +97,12 @@ describe("toolResultCharBudget", () => {
   it("never drops below a useful page", () => {
     expect(toolResultCharBudget(2_048)).toBe(4_000);
   });
+
+  it("keeps the historical bound when the model declares no window", () => {
+    expect(toolResultCharBudget(undefined)).toBe(12_000);
+    expect(toolResultCharBudget(Number.NaN)).toBe(12_000);
+    expect(toolResultCharBudget(0)).toBe(12_000);
+  });
 });
 
 describe("clipToolResultText", () => {
