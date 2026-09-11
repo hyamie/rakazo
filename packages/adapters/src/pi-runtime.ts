@@ -866,7 +866,15 @@ function toAgentTool(tool: ConnectorTool, host: ToolHost, exposedName: string): 
                 return result;
               }
               return {
-                content: [{ type: "text", text: summarizeToolResult(result) }],
+                content: [
+                  {
+                    type: "text",
+                    text: summarizeToolResult(
+                      result,
+                      toolResultCharBudget(host.model.contextWindow),
+                    ),
+                  },
+                ],
                 details: result,
               };
             }
@@ -893,7 +901,12 @@ function toAgentTool(tool: ConnectorTool, host: ToolHost, exposedName: string): 
               return result;
             }
             return {
-              content: [{ type: "text", text: summarizeToolResult(result) }],
+              content: [
+                {
+                  type: "text",
+                  text: summarizeToolResult(result, toolResultCharBudget(host.model.contextWindow)),
+                },
+              ],
               details: result,
             };
           }
@@ -1099,7 +1112,7 @@ async function executeSubagent(host: ToolHost, executionId: string, args: Record
       budgetMessage && streamed.trim()
         ? `${streamed.trim()}\n\n${budgetMessage}`
         : budgetMessage || streamed || assistantText(nested.state.messages.at(-1)) || "done.";
-    const clipped = clipToolResultText(result);
+    const clipped = clipToolResultText(result, toolResultCharBudget(host.model.contextWindow));
     host.queue.push({
       type: "subagent",
       agentId,
@@ -1314,22 +1327,29 @@ function jsonField(spec: unknown): ReturnType<typeof Type.String> {
   return Type.String();
 }
 
-// What the model sees of one tool result or subagent reply. Large enough for a
-// full email thread as HTML; small enough that one call cannot crowd out the turn.
+// What the model sees of one tool result or subagent reply: an eighth of the
+// model's context window, at roughly four characters per token, never more than
+// enough for a full email thread as HTML and never less than a useful page.
 const TOOL_RESULT_MAX_CHARS = 48_000;
+const TOOL_RESULT_MIN_CHARS = 4_000;
 
-export function clipToolResultText(text: string): string {
-  if (text.length <= TOOL_RESULT_MAX_CHARS) return text;
-  // Say so explicitly: a bare ellipsis reads as the end of the data, and the model
-  // then reports what it never saw as absent.
-  return `${text.slice(0, TOOL_RESULT_MAX_CHARS)}\n\n[Tool result truncated: showing the first ${TOOL_RESULT_MAX_CHARS} of ${text.length} characters. Ask for a narrower result if the rest matters.]`;
+export function toolResultCharBudget(contextWindow: number): number {
+  const share = Math.floor(contextWindow / 8) * 4;
+  return Math.min(TOOL_RESULT_MAX_CHARS, Math.max(TOOL_RESULT_MIN_CHARS, share));
 }
 
-function summarizeToolResult(result: unknown) {
+export function clipToolResultText(text: string, limit: number): string {
+  if (text.length <= limit) return text;
+  // Say so explicitly: a bare ellipsis reads as the end of the data, and the model
+  // then reports what it never saw as absent.
+  return `${text.slice(0, limit)}\n\n[Tool result truncated: showing the first ${limit} of ${text.length} characters. Ask for a narrower result if the rest matters.]`;
+}
+
+function summarizeToolResult(result: unknown, limit: number) {
   try {
     const text = JSON.stringify(result);
     if (!text) return "ok";
-    return clipToolResultText(text);
+    return clipToolResultText(text, limit);
   } catch {
     return "ok";
   }
