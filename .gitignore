@@ -41,3 +41,6 @@ PRODUCT_PLAN.md
 apps/web/src/locales/**/*.mjs
 apps/web/src/locales/**/*.js
 apps/web/scripts/msgids.json
+
+# linear-os sync cache (rebuildable from Linear; written only by the sync)
+.linear/

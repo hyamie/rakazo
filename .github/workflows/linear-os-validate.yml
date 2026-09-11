@@ -1,0 +1,31 @@
+name: linear-os-validate
+
+# Installed by linear-os scripts/gate-cohort.sh. Validates docs/PLAN.md against the linear-os
+# schema on every PR and on pushes to the default branch. A missing plan FAILS (never a
+# vacuous pass). Source of truth: hyamie/linear-os .github/actions/validate-plan.
+on:
+  pull_request:
+  push:
+    # RENDERED PER REPO by gate-cohort.sh; a surviving placeholder aborts the install.
+    branches: ["main"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linear-os-validate-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # THE JOB NAME IS THE REQUIRED-CHECK CONTEXT (rulesets name "linear-os-validate").
+  linear-os-validate:
+    name: linear-os-validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # RENDERED PER INSTALL by gate-cohort.sh to the full commit SHA of linear-os master: repos
+      # with "actions must be pinned to a full-length commit SHA" (kcs-crm, 2026-09-11) refuse a
+      # branch ref. Re-run the installer to move the pin.
+      - uses: hyamie/linear-os/.github/actions/validate-plan@09ba8004d63a3938430bc7cf77095bbce78c22d3 # master
+        with:
+          path: docs/PLAN.md
