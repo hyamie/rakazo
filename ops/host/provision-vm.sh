@@ -43,19 +43,25 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+ipv4() {
+  [[ "$1" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+  local octet
+  for octet in "${BASH_REMATCH[@]:1}"; do (( 10#$octet <= 255 )) || return 1; done
+}
+
 [[ -n "$NODE" && -n "$NAME" && -n "$IP_CIDR" && -n "$GATEWAY" && -n "$SSH_KEY_FILE" ]] \
   || die "--node, --name, --ip, --gateway and --ssh-key-file are required"
 [[ "$NAME" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] || die "--name must be a valid hostname label"
-[[ "$IP_CIDR" == */* ]] || die "--ip needs a prefix length, for example 192.0.2.10/24"
+IP="${IP_CIDR%/*}" PREFIX="${IP_CIDR##*/}"
+{ ipv4 "$IP" && [[ "$PREFIX" =~ ^[0-9]{1,2}$ ]] && (( 10#$PREFIX <= 32 )); } \
+  || die "--ip must be an IPv4 address with a prefix length, for example 192.0.2.10/24"
+NAMESERVER="${NAMESERVER:-$GATEWAY}"
+ipv4 "$GATEWAY" || die "--gateway must be an IPv4 address"
+ipv4 "$NAMESERVER" || die "--nameserver must be an IPv4 address"
 [[ -f "$SSH_KEY_FILE" ]] || die "no such key file: $SSH_KEY_FILE"
-# These three reach the node inside single-quoted shell snippets, so a quote in
-# any of them would end the quoting and the rest would be interpreted there.
 [[ -z "$VMID" || "$VMID" =~ ^[0-9]+$ ]] || die "--vmid must be a number"
 [[ "$STORAGE" =~ ^[A-Za-z0-9._-]+$ ]] || die "--storage must be a plain storage id"
-[[ "$IMAGE" == /* && "$IMAGE" != *["'"'"'"$'\n'"]* ]] \
-  || die "--image must be an absolute path with no quote or newline"
-NAMESERVER="${NAMESERVER:-$GATEWAY}"
-IP="${IP_CIDR%/*}"
+[[ "$IMAGE" == /* ]] || die "--image must be an absolute path on the node"
 SSH_AUTHORIZED_KEY="$(head -n1 "$SSH_KEY_FILE")"
 # Ask OpenSSH, rather than matching a name prefix: ecdsa-sha2-* and the
 # sk-* hardware-backed types are valid public keys that no ssh-* prefix matches.
@@ -70,49 +76,50 @@ esac
 # One SSH connection for every call below, including the guest-agent poll.
 CONTROL_DIR="$(mktemp -d)"
 trap 'ssh -o ControlPath="$CONTROL_DIR/cm" -O exit "root@${NODE}" 2>/dev/null; rm -rf "$CONTROL_DIR"' EXIT
-# Run a shell snippet on the node. Whatever is interpolated into the snippet is
-# interpreted by the node's shell, so it has to be quoted for that shell here.
-node_sh() {
-  ssh -o BatchMode=yes -o ControlMaster=auto -o ControlPath="$CONTROL_DIR/cm" -o ControlPersist=60 \
-    "root@${NODE}" "$@"
-}
-
-# Quote one argument for a POSIX shell. Not printf %q: that emits bash's $'...'
-# form for some inputs, which the node's shell may not be.
-shq() { printf "'%s'" "${1//\'/\'\\\'\'}"; }
 
 # Run one command on the node with its argument boundaries intact. ssh joins argv
-# with spaces and hands the result to the remote shell, so local quoting is lost
-# unless each argument carries its own.
+# with spaces and hands the result to the node's shell, so every argument carries
+# its own single quotes (not printf %q: that emits bash's $'...' form for some
+# inputs, which the node's shell may not be). This is the only way anything
+# reaches the node: no value from this script is ever interpolated into a remote
+# shell snippet, so a value that passed validation here cannot become shell
+# syntax there. Snippets that need a pipe or a redirect go through sh -c with
+# their values as positional arguments.
 node_run() {
   local quoted="" arg
-  for arg in "$@"; do quoted+=" $(shq "$arg")"; done
-  node_sh "$quoted"
+  for arg in "$@"; do quoted+=" '${arg//\'/\'\\\'\'}'"; done
+  ssh -o BatchMode=yes -o ControlMaster=auto -o ControlPath="$CONTROL_DIR/cm" -o ControlPersist=60 \
+    "root@${NODE}" "$quoted"
 }
 
 # Probe the address from the node, never from this workstation: a macvtap guest
 # cannot talk to its own host, so a probe from a hypervisor host is blind to that
 # host's guests. The node sits on the same segment the new VM will join.
-if node_sh "ping -c1 -W1 '$IP' >/dev/null 2>&1 || ip neigh show '$IP' | grep -Eq 'lladdr .* (REACHABLE|STALE|DELAY|PERMANENT)'"; then
+# shellcheck disable=SC2016  # $1 is for the node's sh, not this one
+if node_run sh -c 'ping -c1 -W1 "$1" >/dev/null 2>&1 || ip neigh show "$1" | grep -Eq "lladdr .* (REACHABLE|STALE|DELAY|PERMANENT)"' _ "$IP"; then
   die "$IP is answering on the node's segment; pick a free address"
 fi
 
-[[ -n "$VMID" ]] || VMID="$(node pvesh get /cluster/nextid)"
-if node_sh "qm status '$VMID'" >/dev/null 2>&1; then
+if [[ -z "$VMID" ]]; then
+  VMID="$(node_run pvesh get /cluster/nextid)"
+  [[ "$VMID" =~ ^[0-9]+$ ]] || die "the node did not return a numeric VMID: $VMID"
+fi
+if node_run qm status "$VMID" >/dev/null 2>&1; then
   die "VMID $VMID already exists"
 fi
 [[ "$IMAGE_SHA512" =~ ^[0-9a-fA-F]{128}$ ]] \
   || die "--image-sha512 is required and must be 128 hex characters, from the publisher's SHA512SUMS"
-node_sh "test -f '$IMAGE'" || die "image not found on the node: $IMAGE"
+node_run test -f "$IMAGE" || die "image not found on the node: $IMAGE"
 # Verify on the node, against the file qm create will actually import.
-node_sh "printf '%s  %s\\n' '$IMAGE_SHA512' '$IMAGE' | sha512sum -c --status -" \
+# shellcheck disable=SC2016  # $1 and $2 are for the node's sh, not this one
+node_run sh -c 'printf "%s  %s\n" "$1" "$2" | sha512sum -c --status -' _ "$IMAGE_SHA512" "$IMAGE" \
   || die "image on the node does not match --image-sha512: $IMAGE"
 
 SNIPPET="${NAME}-user-data.yaml"
 # shellcheck disable=SC2016  # envsubst must receive the names unexpanded
 VM_HOSTNAME="$NAME" SSH_AUTHORIZED_KEY="$SSH_AUTHORIZED_KEY" \
   envsubst '${VM_HOSTNAME} ${SSH_AUTHORIZED_KEY}' < "$HERE/cloud-init.yaml" \
-  | node_sh "install -d -m 755 /var/lib/vz/snippets && cat > '/var/lib/vz/snippets/$SNIPPET'"
+  | node_run sh -c 'install -d -m 755 /var/lib/vz/snippets && cat > "/var/lib/vz/snippets/$1"' _ "$SNIPPET"
 
 node_run qm create "$VMID" \
   --name "$NAME" \
@@ -137,7 +144,7 @@ node_run qm start "$VMID"
 
 agent_up=""
 for _ in $(seq 1 60); do
-  if node_sh "qm agent '$VMID' ping" >/dev/null 2>&1; then
+  if node_run qm agent "$VMID" ping >/dev/null 2>&1; then
     agent_up=1
     break
   fi
@@ -151,7 +158,7 @@ done
 # the rest of the package list, so returning here would hand the operator a guest
 # whose apt lock is still held and make the bootstrap's install fail at random.
 # The sentinel is what is checked, not the JSON qm wraps the output in.
-node_sh "qm guest exec '$VMID' --timeout 900 -- /bin/sh -c 'cloud-init status --wait >/dev/null 2>&1 && echo CLOUD_INIT_DONE'" \
+node_run qm guest exec "$VMID" --timeout 900 -- /bin/sh -c 'cloud-init status --wait >/dev/null 2>&1 && echo CLOUD_INIT_DONE' \
   | grep -q CLOUD_INIT_DONE \
   || die "VM $VMID came up but cloud-init did not finish cleanly; check 'qm guest exec $VMID -- cloud-init status --long'"
 
