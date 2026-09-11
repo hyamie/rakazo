@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { describeToolActivity } from "./pi-runtime.js";
+import { clipToolResultText, describeToolActivity, toolResultCharBudget } from "./pi-runtime.js";
 
 describe("describeToolActivity", () => {
   it("summarizes builtin tools with their most informative argument", () => {
@@ -80,5 +80,48 @@ describe("describeToolActivity", () => {
 
   it("falls back to the tool name", () => {
     expect(describeToolActivity("destination_write", undefined)).toBe("Using destination_write");
+  });
+});
+
+describe("toolResultCharBudget", () => {
+  it("gives a small local model a small budget", () => {
+    expect(toolResultCharBudget(8_192)).toBe(4_096);
+  });
+
+  it("scales with the window and stops at the ceiling", () => {
+    expect(toolResultCharBudget(16_384)).toBe(8_192);
+    expect(toolResultCharBudget(120_000)).toBe(48_000);
+    expect(toolResultCharBudget(1_000_000)).toBe(48_000);
+  });
+
+  it("never drops below a useful page", () => {
+    expect(toolResultCharBudget(2_048)).toBe(4_000);
+  });
+
+  it("keeps the historical bound when the model declares no window", () => {
+    expect(toolResultCharBudget(undefined)).toBe(12_000);
+    expect(toolResultCharBudget(Number.NaN)).toBe(12_000);
+    expect(toolResultCharBudget(0)).toBe(12_000);
+  });
+});
+
+describe("clipToolResultText", () => {
+  it("returns short results untouched", () => {
+    expect(clipToolResultText("ok", 48_000)).toBe("ok");
+  });
+
+  it("keeps a full email thread as HTML under the ceiling", () => {
+    const thread = "x".repeat(40_000);
+    expect(clipToolResultText(thread, 48_000)).toBe(thread);
+  });
+
+  it("names the truncation and the sizes instead of trailing off", () => {
+    const text = "a".repeat(50_000);
+    const clipped = clipToolResultText(text, 48_000);
+    expect(clipped.startsWith("a".repeat(48_000))).toBe(true);
+    expect(clipped).toContain(
+      "[Tool result truncated: showing the first 48000 of 50000 characters.",
+    );
+    expect(clipped).not.toMatch(/a…$/);
   });
 });
