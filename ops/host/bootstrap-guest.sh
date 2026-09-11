@@ -95,8 +95,11 @@ GIT_SHA=
 RAKAZO_LOCAL_MODELS_API_KEY='${MODEL_KEY}'
 EOF
 )"
+# Every spelling Compose reads as an assignment of the key, or a later line in the
+# vars file quietly wins over the generated one: leading blanks, an `export`
+# prefix, blanks around the delimiter, and `:` as the delimiter.
 while IFS= read -r key; do
-  if grep -Eq "^[[:space:]]*${key}=" "$VARS"; then
+  if grep -Eq "^[[:space:]]*(export[[:space:]]+)?${key}[[:space:]]*[=:]" "$VARS"; then
     die "$VARS sets $key, which this script owns"
   fi
 done < <(sed -nE 's/^([A-Z_]+)=.*/\1/p' <<<"$OWNED_ENV")
