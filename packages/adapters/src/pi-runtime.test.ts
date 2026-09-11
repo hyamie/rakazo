@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { describeToolActivity } from "./pi-runtime.js";
+import { clipToolResultText, describeToolActivity } from "./pi-runtime.js";
 
 describe("describeToolActivity", () => {
   it("summarizes builtin tools with their most informative argument", () => {
@@ -80,5 +80,26 @@ describe("describeToolActivity", () => {
 
   it("falls back to the tool name", () => {
     expect(describeToolActivity("destination_write", undefined)).toBe("Using destination_write");
+  });
+});
+
+describe("clipToolResultText", () => {
+  it("returns short results untouched", () => {
+    expect(clipToolResultText("ok")).toBe("ok");
+  });
+
+  it("keeps a full email thread as HTML", () => {
+    const thread = "x".repeat(40_000);
+    expect(clipToolResultText(thread)).toBe(thread);
+  });
+
+  it("names the truncation and the sizes instead of trailing off", () => {
+    const text = "a".repeat(50_000);
+    const clipped = clipToolResultText(text);
+    expect(clipped.startsWith("a".repeat(48_000))).toBe(true);
+    expect(clipped).toContain(
+      "[Tool result truncated: showing the first 48000 of 50000 characters.",
+    );
+    expect(clipped).not.toMatch(/a…$/);
   });
 });
