@@ -9,10 +9,10 @@ and are carried as branches instead, each shaped as an upstream PR.
 
 | | |
 |---|---|
-| Host | Proxmox VM 102 `rakazo` on `pve-node-2` |
-| Resources | 12 GB fixed (no balloon), 2 vCPU, 150 GB |
-| CPU model | `x86-64-v3`, not `host`, so it can migrate cluster-wide |
-| Disk | `extra-storage` (`/dev/sda`, SATA SSD, own VG) |
+| Host | Proxmox VM 105 `rakazo` on `pve-node-6` |
+| Resources | 12 GB fixed (no balloon), 4 vCPU, 150 GB |
+| CPU model | `x86-64-v3`, not `host`, so the guest boots unchanged on any node |
+| Disk | `vmdata` (ZFS; the same pool name exists on `pve-node-7` for replication) |
 | Network | VLAN 10 `Main`, `192.168.10.30/24`, gateway `.1` (see `network.md`) |
 | Checkout | `/opt/rakazo`, branch `deploy/hds` |
 | Secrets | `/opt/rakazo/.env`, mode 600, generated at deploy |
@@ -22,19 +22,19 @@ adjusts the balloon on a ~10 s pvestatd cycle, which is slow next to a browser
 memory spike. A balloon that inflates late shows up as an OOM kill inside the
 guest, which is the hardest failure to attribute.
 
-The disk sits on `extra-storage` because it is a separate physical device.
-`local-lvm` is on the NVMe that `hyams-postgres` uses, and that Postgres is the
-memory store for the LangGraph agents on node-5. Browser profile and artifact
-churn stays off it.
+It moved from VM 102 on `pve-node-2` on 2026-09-10. Offline `qm migrate` cannot
+copy a disk from `lvmthin` to `zfspool` (the two share no export format) and live
+migration would cross Intel to AMD, so the move was a stop-mode `vzdump` restored
+onto node-6 as a new VMID. The restore keeps the MAC and the IP, which is why the
+old VM stays stopped with `onboot 0` and its link down until it is destroyed.
 
 ### Why a dedicated guest at all
 
-The sandbox supervisor holds a root-equivalent Docker socket. node-2's own
-daemon runs `hyams-postgres`, `steel-browser`, `save-pipeline`, `crawl4ai` and
-the Home Assistant VM, so the supervisor does not go there. The VM boundary is
-the containment, and the VLAN is the second layer: a bot has a browser and a
-shell, and the live CVE class here (browser-use CVE-2025-47241) is exactly
-"agent browser reaches internal services".
+The sandbox supervisor holds a root-equivalent Docker socket, so it never runs on
+a host's own Docker daemon. The VM boundary is the containment: a bot has a
+browser and a shell, and the live CVE class here (browser-use CVE-2025-47241) is
+exactly "agent browser reaches internal services". `network.md` records why the
+dedicated VLAN that used to be the second layer was retired.
 
 ## Deploying
 
@@ -344,10 +344,10 @@ Two things about that edge were wrong out of the box and are fixed in
   detour into the gateway before `--resolve` with a hostname returned 200 against
   the same server. `default_sni` pins the fallback.
 
-**Shell: `ssh rakazo-vm`**, which jumps via `pve-node-2`. Direct SSH to the VM
-works and then stops working on a ~5 minute cycle: the UDM's IPS matches
-`ET SCAN Potential SSH Scan OUTBOUND` (sig 2003068) on inter-VLAN SSH and
-blocklists the flow. HTTPS is unaffected. Full measurement in `ops/network.md`.
+**Shell: `ssh rakazo-vm`**, straight to `192.168.10.30`. It is on the same VLAN
+as the dev hosts, so SSH never crosses the gateway and the UDM's IPS (which
+blocklisted inter-VLAN SSH while the VM sat on VLAN 60) never sees it. History in
+`ops/network.md`.
 
 ## Redeploying
 
@@ -357,3 +357,50 @@ container's config hash off the rendered service definition, and an edit to
 container on the old file. That is not hypothetical: Caddy sat on the upstream
 Caddyfile through a redeploy and kept retrying ACME for `app.example.com` while
 `.env` had already been corrected.
+
+## Setting the login password
+
+`/usr/local/sbin/rakazo-setpw` on the deployment host sets the account password
+from a value on **stdin**. The value is never an argument and never written to
+disk, so it stays out of `ps` and out of shell history:
+
+```
+<read the password from your secret store> \
+  | ssh <deployment-host> sudo /usr/local/sbin/rakazo-setpw
+```
+
+Pipe it in rather than passing it as an argument, and do not echo it into a
+prompt string: anything inside the quotes of a `read -p` is printed and lands in
+shell history.
+
+It hashes with better-auth's own `hashPassword`, round-trip verifies the result,
+and only writes the row if that check passes. A hash this build cannot verify
+would lock the account out, which is the failure the check exists to prevent.
+
+This exists because self-service recovery is unavailable here:
+`sendResetPassword` and `sendVerificationEmail` are both gated on a configured
+email transport, and this deployment has none, so `/api/auth/forget-password`
+returns 404.
+
+Writing the row directly also bypasses better-auth's reset flow, so
+`revokeSessionsOnPasswordReset` does not fire and existing sessions survive.
+
+### Email verification can lock the account out
+
+`requireEmailVerification` is on whenever a signup allowlist is configured, and
+this deployment sets one. With no email transport there is no way to ever
+verify, so an account with `emailVerified = false` is permanently refused at
+sign-in with **"Email not verified"** and no recoverable path. If that happens:
+
+```sql
+update "user" set "emailVerified" = true
+where email = '<account-email>' and "emailVerified" = false;
+```
+
+It must report `UPDATE 1`. Any other count means the address is wrong; stop
+rather than widening the filter, because this flag is what the session hook
+treats as proof of the mailbox.
+
+The sign-in page reports this distinctly from a bad password. Read the screen
+before diagnosing from server logs, which show the rejection but not the reason
+the user was given.
