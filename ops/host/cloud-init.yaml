@@ -1,0 +1,28 @@
+#cloud-config
+# User data for a Rakazo guest, rendered by provision-vm.sh, which substitutes only the
+# hostname and the SSH public key placeholders below. Proxmox still generates the network
+# config from ipconfig0, so addressing never lives here.
+#
+# Docker is deliberately not installed here: bootstrap-guest.sh owns it, so the same
+# script can be re-run to repair a guest instead of requiring a rebuild.
+hostname: ${VM_HOSTNAME}
+manage_etc_hosts: true
+users:
+  - name: rakazo
+    groups: [sudo]
+    shell: /bin/bash
+    sudo: "ALL=(ALL) NOPASSWD:ALL"
+    lock_passwd: true
+    ssh_authorized_keys:
+      - "${SSH_AUTHORIZED_KEY}"
+package_update: true
+package_upgrade: true
+packages:
+  - qemu-guest-agent
+  - git
+  - ca-certificates
+  - curl
+  - gnupg
+  - openssl
+runcmd:
+  - systemctl enable --now qemu-guest-agent
