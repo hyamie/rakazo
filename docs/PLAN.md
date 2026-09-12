@@ -213,12 +213,19 @@ validation:
     pin and exits 0 on the current tree."
 
 ## Decisions
-- This plan and the `linear-os-validate` gate that checks it are filed on `deploy/hds`,
-  not on the repository's GitHub default branch. `main` here is an unmaintained mirror of
-  `upstream/main`, carries none of the fork's own work, and is the base of no pull request,
-  so a gate installed there would validate nothing. The gate's `push` trigger is pinned to
-  `deploy/hds` for the same reason; a re-run of linear-os `gate-cohort.sh` renders the
-  default branch and will need that line kept.
+- This plan is filed on `deploy/hds`, and `deploy/hds` is this repository's default
+  branch. `main` here is an unmaintained mirror of `upstream/main`: it carries none of the
+  fork's own work and is the base of no pull request, including the ones
+  `ops/sync-upstream.sh` opens. The linear-os runner reads `docs/PLAN.md` from
+  `origin/<default>` and treats a missing plan as a failure for the whole cohort run, so
+  the plan and the default branch have to name the same branch.
+- The `linear-os-validate` CI gate is deliberately not installed here yet. It consumes
+  `hyamie/linear-os` as a GitHub Action; that repository is private and this one is
+  public, so the workflow fails at action resolution before it validates anything. The
+  same action at the same pinned commit resolves from a private repository in the cohort,
+  and linear-os is not on PyPI, so there is no tokenless install path. Until the validator
+  is reachable from a public repository, this plan is validated by the linear-os runner
+  after merge rather than by a check before it.
 - `ops/README.md` and `ops/network.md` record the deployment's carried patches, its host
   placement, and why the earlier network isolation VLAN was retired; this plan defers to
   both rather than restating them.
