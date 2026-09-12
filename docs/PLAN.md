@@ -78,13 +78,17 @@ description: >
   `infra/sandboxes/supervisor/src/computer-spec.ts` and its test,
   `packages/adapters/src/model-connect.ts`, and `pnpm-lock.yaml`. The issue's own body
   carries the exact recipe: branch a worktree off `deploy/hds`, merge the named upstream
-  commit, resolve the five files by hand, and regenerate the lockfile. PRs #12 and #13
+  commit, resolve the five files by hand, and regenerate the lockfile. Start that worktree
+  from `origin/deploy/hds`, not from the local branch: `ops/sync-upstream.sh` fetches the
+  remote refs without fast-forwarding the local working branch, so a local `deploy/hds`
+  that lags would merge upstream into an obsolete fork state and silently skip conflicts
+  that newer fork commits introduced. PRs #12 and #13
   were opened before this conflict appeared and cover only part of the range; do not
   merge them as is.
 acceptance:
-  - "Given a worktree branched from deploy/hds, when upstream/main is merged and the five
-    conflicting files are resolved, then pnpm install, pnpm lint, pnpm check and pnpm test
-    all exit 0 and a PR is open against deploy/hds referencing issue #14."
+  - "Given a worktree branched from origin/deploy/hds, when upstream/main is merged and
+    the five conflicting files are resolved, then pnpm install, pnpm lint, pnpm check and
+    pnpm test all exit 0 and a PR is open against deploy/hds referencing issue #14."
 validation:
   - "pnpm install --frozen-lockfile && pnpm db:generate && pnpm lint && pnpm check && pnpm
     test exit 0 on the merge commit, and the deploy/hds PR shows hds-deploy-check green."
@@ -114,15 +118,15 @@ validation:
 milestone: M1
 priority: medium
 labels: [Improvement]
-depends_on: [I001, I002]
+depends_on: [I007]
 description: >
-  Once the merge from I001 lands on deploy/hds, PRs #12 and #13 no longer describe a
+  Once the merge from I007 lands on deploy/hds, PRs #12 and #13 no longer describe a
   useful merge (their upstream commits are already included) and issue #14 no longer
   reflects the current state. Close all three with a note pointing at the landed merge
   commit, then confirm the sync cron itself recognizes the fork as caught up rather than
   opening a redundant PR or issue on its next run.
 acceptance:
-  - "Given the I001 merge is on deploy/hds, when PRs #12 and #13 and issue #14 are closed,
+  - "Given the I007 merge is on deploy/hds, when PRs #12 and #13 and issue #14 are closed,
     then the next run of ops/sync-upstream.sh reports the fork already up to date and
     opens neither a new PR nor a new issue."
 validation:
@@ -156,15 +160,15 @@ validation:
 milestone: M2
 priority: high
 labels: [Improvement]
-depends_on: [I001]
+depends_on: [I007]
 description: >
   The production deployment has not yet picked up commit 78bbac15 (the truncation fix)
-  or, once I001 lands, the upstream sync. ops/deploy.sh pins the compose invocation for
+  or, once I007 lands, the upstream sync. ops/deploy.sh pins the compose invocation for
   this fork (two files, one project directory) and force recreates so a stale container
   cannot survive an .env or image change. Run it on the deployment host once the merge
-  from I001 is on deploy/hds.
+  from I007 is on deploy/hds.
 acceptance:
-  - "Given the I001 merge is on deploy/hds, when ./ops/deploy.sh up runs on the deployment
+  - "Given the I007 merge is on deploy/hds, when ./ops/deploy.sh up runs on the deployment
     host, then the deployment's /health endpoint reports the revision of the new
     deploy/hds tip."
 validation:
@@ -193,6 +197,25 @@ acceptance:
 validation:
   - "pvesh get /cluster/resources --type vm on a cluster node no longer lists the
     pre-migration guest's VMID."
+
+### I007 Merge the sync PR onto deploy/hds
+milestone: M1
+priority: high
+labels: [Improvement]
+depends_on: [I001, I002]
+description: >
+  I001 ends with the sync PR open and green, and I002 ends with the security sensitive
+  adapter diffs read and noted. Neither lands it, and without a step that does, every
+  issue in this plan can be completed while SC-001 stays false and the fork stays behind
+  upstream. The merge is its own step on purpose: it has to come after I002's read rather
+  than inside I001, because approving the adapter hunks is the gate that decides whether
+  the merge is safe to land at all.
+acceptance:
+  - "Given the I001 PR is green and I002's review notes are on it, when the PR is merged,
+    then git merge-base --is-ancestor upstream/main origin/deploy/hds exits 0."
+validation:
+  - "git fetch upstream && git merge-base --is-ancestor upstream/main origin/deploy/hds
+    exits 0."
 
 ## Decisions
 - This plan is filed on `deploy/hds`, and `deploy/hds` is this repository's default
