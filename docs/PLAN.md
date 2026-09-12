@@ -44,8 +44,8 @@ catches it automatically next time.
 - SC-003 The production deployment's health endpoint reports a revision at or after the
   merged sync commit.
 - SC-004 The pre-migration VM no longer appears in the Proxmox cluster's resource list.
-- SC-005 A newly published Expo patch produces a pin-bump PR on `deploy/hds` from a
-  scheduled job, before an unrelated PR turns red and someone fixes it by hand.
+- SC-005 A newly published Expo patch produces a pin-bump PR on `deploy/hds` from a cron job
+  on the RipOrDie host, before an unrelated PR turns red and someone fixes it by hand.
 
 ## Definition of Done
 PR merged with CI green on `.github/workflows/ci.yml` (`pnpm install --frozen-lockfile`,
@@ -75,7 +75,7 @@ validation commands below executed and their output recorded on the issue or PR.
 exit: `git merge-base --is-ancestor upstream/main origin/deploy/hds` exits 0, and issue #14 plus PRs #12 and #13 are closed.
 
 ### M2 Close deployment and maintenance debt
-exit: the production deployment's health endpoint reports the caught up revision, the pre-migration VM is gone from the cluster's resource list, and the scheduled Expo pin job has run on `deploy/hds` and either opened a bump PR or logged an up-to-date result.
+exit: the production deployment's health endpoint reports the caught up revision, the pre-migration VM is gone from the cluster's resource list, and the Expo pin cron job has run against `deploy/hds` and either opened a bump PR or logged an up-to-date result.
 
 ## Issues
 ### I001 Resolve the upstream merge blocking issue #14 and open the sync PR
@@ -210,20 +210,21 @@ description: >
   and #19). The unsolved part is that expo install --check reads Expo's live expectations
   for the installed SDK, so a newly published Expo patch turns every open deploy/hds PR
   red until the pins are bumped by hand, and the bump lands as a reactive fix inside
-  someone else's PR window. Add a scheduled workflow on deploy/hds, following the cron
-  shape ops/sync-upstream.sh already uses for upstream, that runs the mobile check and,
-  when it reports drift, opens a deploy/hds PR bumping the named pins with the lockfile
-  regenerated, so the fix arrives on its own cadence instead of blocking unrelated work.
+  someone else's PR window. Add a second cron job on the RipOrDie host beside
+  ops/sync-upstream.sh (a GitHub schedule trigger would fire only from the default branch,
+  main, which this fork never builds from) that runs the mobile check against deploy/hds
+  and, when it reports drift, opens a deploy/hds PR bumping the named pins with the
+  lockfile regenerated, so the fix arrives on its own cadence instead of blocking
+  unrelated work.
 acceptance:
-  - "Given Expo publishes a new patch for the installed SDK, when the scheduled job next
+  - "Given Expo publishes a new patch for the installed SDK, when the cron job next
     runs, then a deploy/hds PR bumping exactly the pins expo install --check names is
     open, with the lockfile regenerated and the mobile check green on its head."
-  - "Given the pins already match, when the scheduled job runs, then it logs an
+  - "Given the pins already match, when the cron job runs, then it logs an
     up-to-date result and opens nothing."
 validation:
-  - "The scheduled workflow's run log on deploy/hds shows either an up-to-date result or a
-    bump PR opened; pnpm --filter @rakazo/mobile check exits 0 on the deploy/hds tip after
-    that PR merges."
+  - "The cron job's log on the host shows either an up-to-date result or a bump PR opened;
+    pnpm --filter @rakazo/mobile check exits 0 on the deploy/hds tip after that PR merges."
 
 ## Decisions
 - `ops/README.md` and `ops/network.md` (tracked on `deploy/hds`, not on the branch this
