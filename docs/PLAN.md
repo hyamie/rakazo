@@ -3,8 +3,6 @@ key: rakazo
 title: "rakazo"
 team: HDS
 initiative: HDS Products
-repo: hyamie/rakazo
-lead: mike
 appetite: "2 weeks"
 plan_version: 1
 ---
@@ -145,11 +143,17 @@ description: >
   Fork PR #20 (commit 78bbac15) fixed a real defect: every MCP tool result was clipped at
   a fixed character count with a bare ellipsis, which had already dropped material from a
   long tool result out of a live conversation's context. The fix is generic (the cap now
-  derives from the active model's context window) and belongs upstream. Rebase it onto
-  the caught up deploy/hds from I001 and open it against elie222/rakazo:main.
+  derives from the active model's context window) and belongs upstream. Branch from
+  upstream/main and cherry-pick only the truncation fix commits onto that branch, then
+  open it against elie222/rakazo:main. Do not branch from deploy/hds: merging upstream
+  into the fork does not make the two branches identical, so a PR opened from deploy/hds
+  would carry every one of this fork's deployment and behavioral commits into upstream's
+  review.
 acceptance:
-  - "Given deploy/hds is caught up with upstream/main, when the truncation fix is rebased
-    and opened as a PR against elie222/rakazo:main, then upstream's own CI passes on it."
+  - "Given a branch created from upstream/main carrying only the cherry-picked truncation
+    fix commits, when it is opened as a PR against elie222/rakazo:main, then the PR's
+    changed file list contains only the truncation fix and upstream's own CI passes on
+    it."
 validation:
   - "gh pr view against elie222/rakazo shows the PR open with its CI checks green."
 
@@ -182,11 +186,15 @@ description: >
   restore rather than live migration, and that the pre-migration guest was deliberately
   left stopped, with its network link down, as a rollback while the new host proved
   itself. With I005 confirming the new host serves the caught up build correctly,
-  destroy the old guest and update ops/README.md's host row to drop the rollback note.
+  destroy the old guest, then correct the migration paragraph in ops/README.md that still
+  says the old guest stays stopped until it is destroyed. The host table row is not the
+  place to look: it never carried a rollback caveat, so an acceptance written against it
+  would pass without anyone touching the stale sentence.
 acceptance:
   - "Given the redeploy in I005 is verified healthy, when the pre-migration VM is
-    destroyed, then it no longer appears in the cluster's resource list and
-    ops/README.md's host row carries no rollback caveat."
+    destroyed, then it no longer appears in the cluster's resource list and the migration
+    paragraph in ops/README.md no longer states that the old guest is kept stopped as a
+    rollback."
 validation:
   - "pvesh get /cluster/resources --type vm on a cluster node no longer lists the
     pre-migration guest's VMID."
