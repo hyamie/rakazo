@@ -19,28 +19,23 @@ reporting 29 commits behind `upstream/main` with five files in real conflict. Tw
 PRs, #12 and #13, were opened before that conflict appeared and no longer cover the full
 range.
 
-Separately, the fork carries three smaller pieces of maintenance debt, each already
+Separately, the fork carries two smaller pieces of maintenance debt, each already
 described in the fork's own tracked history. The host that runs the deployment was
 migrated to new hardware on 2026-09-10 (`ops/README.md`), and the pre-migration guest is
 still kept powered off as a rollback that has not yet been retired. The production
 deployment has not yet picked up the most recently merged fix (fork PR #20, the tool
-result truncation fix, commit `78bbac15`). And the Expo mobile pins have needed a manual,
-reactive fix twice in this fork's own history (PRs #18 and #19), because the repo's own
-mobile install check only runs on push to `main` in `.github/workflows/ci.yml`, which
-never fires for this fork's `deploy/hds` line.
+result truncation fix, commit `78bbac15`).
 
 ## Outcome
 `deploy/hds` is caught up with `upstream/main`, the production deployment is running that
-caught up build, and each piece of carried maintenance debt (the retired VM, the
-un-upstreamed fix, the Expo pin drift) is either closed out or backed by a check that
-catches it automatically next time.
+caught up build, and both pieces of carried maintenance debt, the un-retired VM and the
+un-upstreamed fix, are closed out.
 - SC-001 `git merge-base --is-ancestor` reports `upstream/main` as an ancestor of
   `origin/deploy/hds`.
 - SC-002 GitHub issue #14 and pull requests #12 and #13 on `hyamie/rakazo` are closed.
 - SC-003 The production deployment's health endpoint reports a revision at or after the
   merged sync commit.
 - SC-004 The pre-migration VM no longer appears in the Proxmox cluster's resource list.
-- SC-005 A deliberately mismatched Expo SDK package pin fails CI before merge.
 
 ## Definition of Done
 PR merged with CI green on `.github/workflows/ci.yml` (`pnpm install --frozen-lockfile`,
@@ -69,7 +64,7 @@ validation commands below executed and their output recorded on the issue or PR.
 exit: `git merge-base --is-ancestor upstream/main origin/deploy/hds` exits 0, and issue #14 plus PRs #12 and #13 are closed.
 
 ### M2 Close deployment and maintenance debt
-exit: the production deployment's health endpoint reports the caught up revision, the pre-migration VM is gone from the cluster's resource list, and CI fails a deliberately mismatched Expo pin.
+exit: the production deployment's health endpoint reports the caught up revision and the pre-migration VM is gone from the cluster's resource list.
 
 ## Issues
 ### I001 Resolve the upstream merge blocking issue #14 and open the sync PR
@@ -199,27 +194,6 @@ validation:
   - "pvesh get /cluster/resources --type vm on a cluster node no longer lists the
     pre-migration guest's VMID."
 
-### I007 Gate deploy/hds PRs on the mobile install check
-milestone: M2
-priority: low
-labels: [Improvement]
-depends_on: []
-description: >
-  The mobile app already has a working drift check: apps/mobile's own "check" script
-  runs expo install --check ahead of a plain typecheck. But ci.yml only calls it inside
-  publish-mobile-update, which is gated to push on main, so it never runs against a
-  deploy/hds PR. That gap is why apps/mobile/package.json pins have needed two reactive
-  fixes in this fork's history (PRs #18 and #19) with nothing catching the mismatch
-  first. Add the same check as a step in hds-deploy-check.yml, the fork's own PR gate for
-  deploy/hds, so a pin mismatch fails the PR instead of a later build.
-acceptance:
-  - "Given a PR into deploy/hds bumps expo or a sibling expo-*/react-native-* package out
-    of alignment with the SDK's expected versions, when hds-deploy-check runs, then the
-    new step fails before merge."
-validation:
-  - "pnpm --filter @rakazo/mobile check exits non-zero against a deliberately mismatched
-    pin and exits 0 on the current tree."
-
 ## Decisions
 - This plan is filed on `deploy/hds`, and `deploy/hds` is this repository's default
   branch. `main` here is an unmaintained mirror of `upstream/main`: it carries none of the
@@ -234,6 +208,13 @@ validation:
   and linear-os is not on PyPI, so there is no tokenless install path. Until the validator
   is reachable from a public repository, this plan is validated by the linear-os runner
   after merge rather than by a check before it.
+- Gating deploy/hds pull requests on the Expo pin check was proposed and then dropped,
+  because the gate already exists. `ci.yml` runs its `check` job on `pull_request` with no
+  branch filter, that job runs `pnpm check`, the root script expands to `turbo check`, and
+  apps/mobile's own `check` is `expo install --check && tsc --noEmit`. Confirmed on a real
+  pull request rather than by reading the chain: fork PR #21's Typecheck job ran
+  `expo install --check` and failed on the mismatched pins. The two reactive pin fixes in
+  this fork's history were that gate working, not a gap in it.
 - `ops/README.md` and `ops/network.md` record the deployment's carried patches, its host
   placement, and why the earlier network isolation VLAN was retired; this plan defers to
   both rather than restating them.
