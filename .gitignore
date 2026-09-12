@@ -51,3 +51,6 @@ playwright-report-www
 
 # LAN gateway certificate: deployment data, copied to the host out of band.
 ops/certs/
+
+# linear-os sync cache (rebuildable from Linear; written only by the sync)
+.linear/
